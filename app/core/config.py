@@ -13,34 +13,34 @@ class Settings(BaseSettings):
     ALGORITHM: str = "HS256"
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 1440
 
-    # When true, WhatsAppService never calls a real provider — every send is
-    # logged to ActivityLog and returned as a simulated success. Flip this
-    # (and fill in META_* below) when real integration is ready; no other
-    # code changes needed since routers only ever talk to the service interface.
+    # When true, sends are faked (no network call) — local development only.
+    # Set false in production so messages really go out through Unipile.
     WHATSAPP_MOCK: bool = True
-    WHATSAPP_PROVIDER: str = "mock"
-    META_ACCESS_TOKEN: str = ""
-    META_PHONE_NUMBER_ID: str = ""
-    META_BUSINESS_ACCOUNT_ID: str = ""
 
-    # Twilio (WHATSAPP_PROVIDER=twilio). Account SID + Auth Token from the
-    # Twilio Console home page. The Auth Token is a password — .env only.
-    TWILIO_ACCOUNT_SID: str = ""
-    TWILIO_AUTH_TOKEN: str = ""
+    # Unipile v2. UNIPILE_API_KEY: a Service Key (it also manages webhooks) from
+    # the Unipile dashboard > API Keys, sent as X-API-KEY. Keys expire — rotate
+    # before the expiry date. UNIPILE_WEBHOOK_SECRET: signing secret of the webhook
+    # endpoint you create there. Both are passwords — environment only.
+    UNIPILE_API_KEY: str = ""
+    UNIPILE_BASE_URL: str = "https://api.unipile.com/v2"
+    UNIPILE_WEBHOOK_SECRET: str = ""
+    # Where to send the browser after a WhatsApp account is linked (optional).
+    FRONTEND_URL: str = ""
 
-    # WasenderAPI (WHATSAPP_PROVIDER=wasender). Session API key from
-    # wasenderapi.com dashboard -> your WhatsApp session. It's a password.
-    WASENDER_API_KEY: str = ""
-    WASENDER_BASE_URL: str = "https://www.wasenderapi.com/api"
-
-    # Public https URL where Twilio can reach this backend (e.g. your Render
-    # URL or a cloudflared/ngrok tunnel). Needed for incoming messages and
-    # delivered/read ticks; sending works without it.
+    # Public https URL of this backend (e.g. https://relay-backend.onrender.com).
+    # Unipile redirects the browser here after a WhatsApp account is linked.
     PUBLIC_BASE_URL: str = ""
 
-    # Campaign sending pace. The Twilio sandbox allows ~1 msg / 3 s; a real
-    # registered sender allows far more (80/s) — lower this to e.g. 0.05 then.
-    CAMPAIGN_SEND_INTERVAL_SECONDS: float = 3.0
+    # Seconds between campaign messages. These are normal WhatsApp accounts, not
+    # the official Business API — keep this at 5+ to protect numbers from bans.
+    CAMPAIGN_SEND_INTERVAL_SECONDS: float = 5.0
+
+    # Optional first Super Admin, created on startup if that email doesn't exist
+    # yet (so production never needs the demo seed). Remove the password
+    # variable once you've logged in and changed it if you like.
+    BOOTSTRAP_ADMIN_EMAIL: str = ""
+    BOOTSTRAP_ADMIN_PASSWORD: str = ""
+    BOOTSTRAP_ADMIN_NAME: str = "Super Admin"
 
     # Google Sign-In. Empty = the "Sign in with Google" button is hidden.
     # Only the OAuth *Client ID* is needed (no client secret for this flow).

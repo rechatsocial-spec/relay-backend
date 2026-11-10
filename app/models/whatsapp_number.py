@@ -24,6 +24,8 @@ class WhatsAppNumber(Base):
     display_name: Mapped[str] = mapped_column(String(120))
     waba_id: Mapped[str | None] = mapped_column(String(120), nullable=True)
     phone_number_id: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    # Unipile account id ("acc_…") of the linked WhatsApp session, if any.
+    unipile_account_id: Mapped[str | None] = mapped_column(String(120), nullable=True, index=True)
     admin_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("users.id"))
     status: Mapped[NumberStatus] = mapped_column(Enum(NumberStatus, name="number_status"), default=NumberStatus.ACTIVE)
 

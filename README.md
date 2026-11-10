@@ -108,35 +108,49 @@ if per-tenant isolation is ever needed.
 | `apiKeyService` | `/api-keys` | `app/api/v1/endpoints/api_keys.py` |
 | Activity Logs | `/activity-logs` | `app/api/v1/endpoints/activity_logs.py` |
 
-## WhatsApp integration — currently mocked, on purpose
+## WhatsApp integration — Unipile only
 
 Every message-sending code path (inbox replies, campaign dispatch, welcome
-automation) calls `app.services.whatsapp_service.get_whatsapp_service()`,
-never a provider SDK directly. Right now `WHATSAPP_MOCK=true` in `.env`
-routes every call to `MockWhatsAppService`, which fakes a successful send
-and returns a mock message ID — no network call happens.
+automation) calls `app.services.whatsapp_service.get_whatsapp_service()`.
+`WHATSAPP_MOCK=true` fakes sends for local development; `WHATSAPP_MOCK=false`
+sends through [Unipile v2](https://developer.unipile.com/v2.0/docs/) — WhatsApp
+accounts linked by QR / pairing code. There are no other providers.
+Code: `UnipileWhatsAppService` in `whatsapp_service.py`, routes in
+`app/api/v1/endpoints/unipile.py`.
 
-**To go live later:**
-1. Fill in `MetaCloudWhatsAppService` in `app/services/whatsapp_service.py`
-   (each method currently raises `NotImplementedError` with a pointer to the
-   Meta Graph API endpoint to call).
-2. Set `META_ACCESS_TOKEN`, `META_PHONE_NUMBER_ID`, `META_BUSINESS_ACCOUNT_ID`
-   in `.env`.
-3. Flip `WHATSAPP_MOCK=false`.
+1. Unipile dashboard → your Application → API Keys → **Service Keys**: create one →
+   `UNIPILE_API_KEY` (shown once; keys expire, rotate before the date; sent as `X-API-KEY`).
+2. Dashboard → Webhooks → add `{PUBLIC_BASE_URL}/api/v1/unipile/webhook` with events
+   `message.new`, `message.receipt.delivery`, `message.receipt.read`,
+   `account.status.*`, `account.remove`; copy its signing secret → `UNIPILE_WEBHOOK_SECRET`.
+3. Set `PUBLIC_BASE_URL`, `WHATSAPP_MOCK=false`.
+4. As Super Admin: WhatsApp Numbers → **Link via Unipile** (or `POST /api/v1/unipile/link`),
+   scan the QR code in the new tab. The number appears in the CRM.
 
-No router or model changes needed — they only ever talk to the interface.
+Limits: no templates and no 24h window (it's a normal WhatsApp account — pace
+campaigns with `CAMPAIGN_SEND_INTERVAL_SECONDS` of 5+ to avoid bans); group chats are
+ignored, and senders whose phone Unipile doesn't expose (`@lid` with no `public_identifier`) are skipped
+and noted in the activity log. Test without an account: `python test_unipile.py`.
 
-**Not yet built, needed before real sends work:**
-- A webhook receiver for delivery/read status callbacks and inbound
-  messages (currently `WhatsAppNumber.messages_today` / `delivery_rate` /
-  `reply_rate` are static columns a webhook handler would update).
-- A background worker (Celery/RQ) for campaign dispatch — `POST
-  /campaigns/{id}/launch` currently just flips status to `Running`; iterating
-  the audience and actually sending (with rate limiting) is a queued job in
-  production, not something to do inline in a request handler.
-- Message template management/approval tracking (Meta requires
-  Meta-approved templates for any business-initiated message outside the
-  24-hour customer service window).
+### Automations on incoming chats
+
+When a `message.new` comes from someone who is not yet a contact, every **Running**
+automation of that number's admin with trigger `new_customer` starts a run
+(`app/services/automation_runner.py`). A poller thread (every 5 s) executes the flow
+nodes in order: send a `messageVariants` text (`{{name}}` works), wait (`delay_minutes`
+or parsed from "Wait 2 hours"), then the "Customer replied?" condition runs the nodes tagged
+`YES` or `NO`. An action whose label contains "human"/"transfer"/"assign" hands the chat to
+a human. Runs are stored in `automation_runs`, so waits survive restarts; pausing the
+automation stops waiting runs; opted-out contacts are never messaged. Chatbots (keyword
+menus) are not wired to incoming messages yet.
+
+## Deploying on Render
+
+`render.yaml` is a Blueprint: a web service plus a Postgres database. Run **one**
+instance only (campaigns are sent by an in-process worker that resumes after restarts).
+Set the secret variables marked `sync: false` in the dashboard. In production use
+`BOOTSTRAP_ADMIN_EMAIL` / `BOOTSTRAP_ADMIN_PASSWORD` instead of `python -m app.seed`
+(the seed creates demo logins with a known password).
 
 ## CORS
 
@@ -194,5 +208,5 @@ app/
 │   ├── deps.py            auth + role + admin-scope dependencies
 │   └── v1/endpoints/      one router file per entity
 └── services/
-    └── whatsapp_service.py   mock + (stubbed) real WhatsApp integration
+    └── whatsapp_service.py   mock + Unipile WhatsApp integration
 ```

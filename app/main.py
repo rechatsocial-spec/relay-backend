@@ -5,6 +5,8 @@ from app.core.config import settings
 from app.db.base import Base
 from app.db.session import engine
 from app.db.auto_migrate import upgrade_schema
+from app.bootstrap import ensure_bootstrap_admin
+from app.services.automation_runner import start_poller
 from app.services.campaign_runner import resume_interrupted_campaigns
 from app.api.v1.api import api_router
 
@@ -33,7 +35,9 @@ def on_startup():
     # real data you can't afford to lose on a schema change.
     Base.metadata.create_all(bind=engine)
     upgrade_schema(engine)  # adds new columns to existing tables (dev convenience)
-    resume_interrupted_campaigns()  # campaigns left Running by a restart carry on
+    ensure_bootstrap_admin()
+    resume_interrupted_campaigns()
+    start_poller()  # runs due automation steps (welcome messages, waits, follow-ups)  # campaigns left Running by a restart carry on
 
 
 @app.get("/health")
@@ -41,5 +45,5 @@ def health():
     return {
         "status": "ok",
         "whatsapp_mock": settings.WHATSAPP_MOCK,
-        "whatsapp_provider": "mock" if settings.WHATSAPP_MOCK else settings.WHATSAPP_PROVIDER,
+        "whatsapp_provider": "mock" if settings.WHATSAPP_MOCK else "unipile",
     }

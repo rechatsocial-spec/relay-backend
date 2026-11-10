@@ -38,7 +38,7 @@ class Campaign(Base):
     message_type: Mapped[MessageContentType] = mapped_column(Enum(MessageContentType, name="campaign_msg_type"), default=MessageContentType.TEXT)
     message_text: Mapped[str | None] = mapped_column(Text, nullable=True)
     media_url: Mapped[str | None] = mapped_column(String(500), nullable=True)
-    # Approved WhatsApp template (Twilio Content SID "HX…") + its {{1}}, {{2}} values.
+    # Legacy template id — not supported by Unipile (sends are rejected).
     # Required to reach anyone who hasn't messaged you in the last 24h.
     content_sid: Mapped[str | None] = mapped_column(String(64), nullable=True)
     content_variables: Mapped[dict | None] = mapped_column(JSON, nullable=True)

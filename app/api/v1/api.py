@@ -2,7 +2,7 @@ from fastapi import APIRouter
 
 from app.api.v1.endpoints import (
     auth, admins, numbers, contacts, inbox, campaigns,
-    automations, chatbot, analytics, api_keys, activity_logs, webhooks, system,
+    automations, chatbot, analytics, api_keys, activity_logs, system, unipile,
 )
 
 api_router = APIRouter()
@@ -17,5 +17,5 @@ api_router.include_router(chatbot.router)
 api_router.include_router(analytics.router)
 api_router.include_router(api_keys.router)
 api_router.include_router(activity_logs.router)
-api_router.include_router(webhooks.router)
 api_router.include_router(system.router)
+api_router.include_router(unipile.router)

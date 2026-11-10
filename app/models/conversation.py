@@ -28,6 +28,8 @@ class Conversation(Base):
     # Last time the *customer* wrote. WhatsApp only allows free-form replies
     # within 24h of this; after that you must send an approved template.
     last_inbound_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # Unipile chat id exactly as returned (may end in @lid) — replies are sent to it.
+    provider_chat_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
     messages = relationship("Message", back_populates="conversation", order_by="Message.created_at")

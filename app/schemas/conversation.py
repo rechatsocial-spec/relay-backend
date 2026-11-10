@@ -29,7 +29,7 @@ class SendMessageRequest(BaseModel):
     text: str | None = None
     media_url: str | None = None
     duration_seconds: int | None = None
-    # Template sends (needed outside the 24h window): Twilio Content SID + {"1": "..."}
+    # Template sends (needed outside the 24h window): unsupported with Unipile — the send is rejected with a clear error
     content_sid: str | None = None
     content_variables: dict | None = None
 
