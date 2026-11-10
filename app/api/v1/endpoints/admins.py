@@ -1,7 +1,10 @@
 import uuid
 
 from fastapi import APIRouter, Depends, HTTPException
+import logging
+
 from sqlalchemy import func
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from app.api.deps import require_super_admin, get_current_user
@@ -19,6 +22,7 @@ from app.models.whatsapp_number import WhatsAppNumber
 from app.models.contact import Contact, ContactStatus
 from app.schemas.admin import AdminCreate, AdminUpdate, AdminOut, AdminPerformanceOut
 
+log = logging.getLogger("relay.admins")
 router = APIRouter(prefix="/admins", tags=["admins"])
 
 LEAD_STATUSES = [ContactStatus.QUALIFIED, ContactStatus.DEMO, ContactStatus.CONVERTED]
@@ -75,6 +79,15 @@ def update_admin(admin_id: uuid.UUID, payload: AdminUpdate, db: Session = Depend
     return admin
 
 
+def _fail(db: Session, e: Exception):
+    """Roll back and return the real DB error as JSON (with CORS headers), so
+    the UI shows it instead of a generic 'could not reach backend'."""
+    db.rollback()
+    log.exception("admin delete failed")
+    detail = str(getattr(e, "orig", e)).strip().splitlines()[0][:300]
+    raise HTTPException(500, f"Delete failed ({type(e).__name__}): {detail}")
+
+
 def _purge_admin(db: Session, admin: User) -> None:
     """Delete an Admin and everything they own. Caller commits."""
     admin_id = admin.id
@@ -95,10 +108,13 @@ def delete_all_admins(db: Session = Depends(get_db), me: User = Depends(require_
     """Permanently removes EVERY Admin (role=admin) and all their data.
     Super Admin accounts are never touched."""
     admins = db.query(User).filter(User.role == Role.ADMIN).all()
-    for a in admins:
-        _purge_admin(db, a)
-    db.add(ActivityLog(actor_id=me.id, type="admin", message=f"{me.name} deleted all admins ({len(admins)})"))
-    db.commit()
+    try:
+        for a in admins:
+            _purge_admin(db, a)
+        db.add(ActivityLog(actor_id=me.id, type="admin", message=f"{me.name} deleted all admins ({len(admins)})"))
+        db.commit()
+    except SQLAlchemyError as e:
+        _fail(db, e)
     return {"deleted": len(admins)}
 
 
@@ -112,8 +128,11 @@ def delete_admin(admin_id: uuid.UUID, db: Session = Depends(get_db), me: User = 
     if admin.role == Role.SUPER_ADMIN or admin.id == me.id:
         raise HTTPException(400, "Super Admin accounts can't be deleted here")
     db.add(ActivityLog(actor_id=me.id, type="admin", message=f"{me.name} deleted admin {admin.name} ({admin.email})"))
-    _purge_admin(db, admin)
-    db.commit()
+    try:
+        _purge_admin(db, admin)
+        db.commit()
+    except SQLAlchemyError as e:
+        _fail(db, e)
 
 
 @router.get("/me", response_model=AdminOut)
