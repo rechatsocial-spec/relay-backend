@@ -1,7 +1,9 @@
 import uuid
 from datetime import datetime
 
-from pydantic import BaseModel, EmailStr
+from pydantic import BaseModel, EmailStr, field_validator
+
+from app.core.pages import DEFAULT_HIDDEN_PAGES
 
 from app.models.user import Role, UserStatus
 
@@ -18,6 +20,7 @@ class AdminUpdate(BaseModel):
     name: str | None = None
     phone: str | None = None
     status: UserStatus | None = None
+    hidden_pages: list[str] | None = None
 
 
 class AdminOut(BaseModel):
@@ -28,9 +31,19 @@ class AdminOut(BaseModel):
     role: Role
     status: UserStatus
     created_at: datetime
+    hidden_pages: list[str] = []
 
     class Config:
         from_attributes = True
+
+    @field_validator("hidden_pages", mode="before")
+    @classmethod
+    def _split_hidden(cls, v, info):
+        if isinstance(v, list):
+            return v
+        if v is None:
+            return list(DEFAULT_HIDDEN_PAGES)
+        return [p for p in v.split(",") if p]
 
 
 class AdminPerformanceOut(AdminOut):

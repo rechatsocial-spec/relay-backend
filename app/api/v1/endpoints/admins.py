@@ -7,6 +7,13 @@ from sqlalchemy.orm import Session
 from app.api.deps import require_super_admin, get_current_user
 from app.core.security import hash_password
 from app.db.session import get_db
+from app.core.pages import TOGGLEABLE_PAGES
+from app.models.activity_log import ActivityLog
+from app.models.api_key import ApiKey
+from app.models.automation import Automation
+from app.models.campaign import Campaign
+from app.models.chatbot import Chatbot
+from app.models.conversation import Conversation, Message
 from app.models.user import User, Role
 from app.models.whatsapp_number import WhatsAppNumber
 from app.models.contact import Contact, ContactStatus
@@ -54,11 +61,43 @@ def update_admin(admin_id: uuid.UUID, payload: AdminUpdate, db: Session = Depend
     admin = db.get(User, admin_id)
     if not admin:
         raise HTTPException(404, "Admin not found")
-    for field, value in payload.model_dump(exclude_unset=True).items():
+    data = payload.model_dump(exclude_unset=True)
+    if "hidden_pages" in data:
+        pages = data.pop("hidden_pages") or []
+        bad = [p for p in pages if p not in TOGGLEABLE_PAGES]
+        if bad:
+            raise HTTPException(400, f"Unknown page(s): {', '.join(bad)}")
+        admin.hidden_pages = ",".join(dict.fromkeys(pages))
+    for field, value in data.items():
         setattr(admin, field, value)
     db.commit()
     db.refresh(admin)
     return admin
+
+
+@router.delete("/{admin_id}", status_code=204)
+def delete_admin(admin_id: uuid.UUID, db: Session = Depends(get_db), me: User = Depends(require_super_admin)):
+    """Permanently removes an Admin AND everything they own (numbers, contacts,
+    conversations, campaigns, automations, chatbots). Super Admins can't be
+    deleted here, and you can't delete yourself."""
+    admin = db.get(User, admin_id)
+    if not admin:
+        raise HTTPException(404, "Admin not found")
+    if admin.role == Role.SUPER_ADMIN or admin.id == me.id:
+        raise HTTPException(400, "Super Admin accounts can't be deleted here")
+
+    convo_ids = [c for (c,) in db.query(Conversation.id).filter(Conversation.admin_id == admin_id)]
+    if convo_ids:
+        db.query(Message).filter(Message.conversation_id.in_(convo_ids)).delete(synchronize_session=False)
+    for model in (Conversation, Campaign, Automation, Chatbot, Contact):
+        db.query(model).filter(model.admin_id == admin_id).delete(synchronize_session=False)
+    db.query(WhatsAppNumber).filter(WhatsAppNumber.admin_id == admin_id).delete(synchronize_session=False)
+    # Keep other people's audit trail; just detach the deleted user.
+    db.query(ActivityLog).filter(ActivityLog.actor_id == admin_id).update({ActivityLog.actor_id: None}, synchronize_session=False)
+    db.query(ApiKey).filter(ApiKey.updated_by == admin_id).update({ApiKey.updated_by: None}, synchronize_session=False)
+    db.add(ActivityLog(actor_id=me.id, type="admin", message=f"{me.name} deleted admin {admin.name} ({admin.email})"))
+    db.delete(admin)
+    db.commit()
 
 
 @router.get("/me", response_model=AdminOut)

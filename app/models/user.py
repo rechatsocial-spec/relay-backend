@@ -2,7 +2,7 @@ import enum
 import uuid
 from datetime import datetime
 
-from sqlalchemy import String, Enum, DateTime, func
+from sqlalchemy import String, Enum, DateTime, Text, func
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from sqlalchemy.dialects.postgresql import UUID
 
@@ -34,6 +34,9 @@ class User(Base):
     hashed_password: Mapped[str] = mapped_column(String(255))
     role: Mapped[Role] = mapped_column(Enum(Role, name="user_role"), default=Role.ADMIN)
     status: Mapped[UserStatus] = mapped_column(Enum(UserStatus, name="user_status"), default=UserStatus.ACTIVE)
+    # Comma-separated sidebar pages hidden from this Admin. NULL = the default
+    # set (see app/core/pages.py). Super Admins ignore it.
+    hidden_pages: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
     whatsapp_numbers = relationship("WhatsAppNumber", back_populates="admin", foreign_keys="WhatsAppNumber.admin_id")

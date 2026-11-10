@@ -21,3 +21,4 @@ class TokenResponse(BaseModel):
     role: str
     user_id: str
     name: str
+    hidden_pages: list[str] = []

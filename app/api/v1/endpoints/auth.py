@@ -4,6 +4,7 @@ from sqlalchemy.orm import Session
 
 from app.core.config import settings
 from app.core.google_auth import GoogleAuthError, GoogleUnavailableError, verify_google_credential
+from app.core.pages import hidden_pages_for
 from app.core.security import verify_password, create_access_token
 from app.db.session import get_db
 from app.models.activity_log import ActivityLog
@@ -17,7 +18,8 @@ def _token_for(user: User) -> TokenResponse:
     if user.status != UserStatus.ACTIVE:
         raise HTTPException(status.HTTP_403_FORBIDDEN, "This account is inactive")
     token = create_access_token(subject=str(user.id), role=user.role.value)
-    return TokenResponse(access_token=token, role=user.role.value, user_id=str(user.id), name=user.name)
+    return TokenResponse(access_token=token, role=user.role.value, user_id=str(user.id), name=user.name,
+                         hidden_pages=hidden_pages_for(user))
 
 
 @router.get("/config", response_model=AuthConfigOut)
