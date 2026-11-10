@@ -75,28 +75,44 @@ def update_admin(admin_id: uuid.UUID, payload: AdminUpdate, db: Session = Depend
     return admin
 
 
-@router.delete("/{admin_id}", status_code=204)
-def delete_admin(admin_id: uuid.UUID, db: Session = Depends(get_db), me: User = Depends(require_super_admin)):
-    """Permanently removes an Admin AND everything they own (numbers, contacts,
-    conversations, campaigns, automations, chatbots). Super Admins can't be
-    deleted here, and you can't delete yourself."""
-    admin = db.get(User, admin_id)
-    if not admin:
-        raise HTTPException(404, "Admin not found")
-    if admin.role == Role.SUPER_ADMIN or admin.id == me.id:
-        raise HTTPException(400, "Super Admin accounts can't be deleted here")
-
+def _purge_admin(db: Session, admin: User) -> None:
+    """Delete an Admin and everything they own. Caller commits."""
+    admin_id = admin.id
     convo_ids = [c for (c,) in db.query(Conversation.id).filter(Conversation.admin_id == admin_id)]
     if convo_ids:
         db.query(Message).filter(Message.conversation_id.in_(convo_ids)).delete(synchronize_session=False)
     for model in (Conversation, Campaign, Automation, Chatbot, Contact):
         db.query(model).filter(model.admin_id == admin_id).delete(synchronize_session=False)
     db.query(WhatsAppNumber).filter(WhatsAppNumber.admin_id == admin_id).delete(synchronize_session=False)
-    # Keep other people's audit trail; just detach the deleted user.
+    # Keep the audit trail; just detach the deleted user.
     db.query(ActivityLog).filter(ActivityLog.actor_id == admin_id).update({ActivityLog.actor_id: None}, synchronize_session=False)
     db.query(ApiKey).filter(ApiKey.updated_by == admin_id).update({ApiKey.updated_by: None}, synchronize_session=False)
-    db.add(ActivityLog(actor_id=me.id, type="admin", message=f"{me.name} deleted admin {admin.name} ({admin.email})"))
     db.delete(admin)
+
+
+@router.delete("", dependencies=[Depends(require_super_admin)])
+def delete_all_admins(db: Session = Depends(get_db), me: User = Depends(require_super_admin)):
+    """Permanently removes EVERY Admin (role=admin) and all their data.
+    Super Admin accounts are never touched."""
+    admins = db.query(User).filter(User.role == Role.ADMIN).all()
+    for a in admins:
+        _purge_admin(db, a)
+    db.add(ActivityLog(actor_id=me.id, type="admin", message=f"{me.name} deleted all admins ({len(admins)})"))
+    db.commit()
+    return {"deleted": len(admins)}
+
+
+@router.delete("/{admin_id}", status_code=204)
+def delete_admin(admin_id: uuid.UUID, db: Session = Depends(get_db), me: User = Depends(require_super_admin)):
+    """Permanently removes an Admin AND everything they own. Super Admins
+    can't be deleted here, and you can't delete yourself."""
+    admin = db.get(User, admin_id)
+    if not admin:
+        raise HTTPException(404, "Admin not found")
+    if admin.role == Role.SUPER_ADMIN or admin.id == me.id:
+        raise HTTPException(400, "Super Admin accounts can't be deleted here")
+    db.add(ActivityLog(actor_id=me.id, type="admin", message=f"{me.name} deleted admin {admin.name} ({admin.email})"))
+    _purge_admin(db, admin)
     db.commit()
 
 
