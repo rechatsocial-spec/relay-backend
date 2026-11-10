@@ -3,7 +3,7 @@ import uuid
 from fastapi import APIRouter, Depends, HTTPException
 import logging
 
-from sqlalchemy import func
+from sqlalchemy import func, or_, select
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
@@ -89,17 +89,30 @@ def _fail(db: Session, e: Exception):
 
 
 def _purge_admin(db: Session, admin: User) -> None:
-    """Delete an Admin and everything they own. Caller commits."""
-    admin_id = admin.id
-    convo_ids = [c for (c,) in db.query(Conversation.id).filter(Conversation.admin_id == admin_id)]
-    if convo_ids:
-        db.query(Message).filter(Message.conversation_id.in_(convo_ids)).delete(synchronize_session=False)
-    for model in (Conversation, Campaign, Automation, Chatbot, Contact):
-        db.query(model).filter(model.admin_id == admin_id).delete(synchronize_session=False)
-    db.query(WhatsAppNumber).filter(WhatsAppNumber.admin_id == admin_id).delete(synchronize_session=False)
+    """Delete an Admin and everything attached to them. Caller commits.
+
+    Rows are matched by owner (admin_id) OR by the admin's WhatsApp numbers,
+    because a row can point at one of this admin's numbers while being owned
+    by someone else; leaving it would break the numbers' foreign keys.
+    """
+    aid = admin.id
+    nums = select(WhatsAppNumber.id).where(WhatsAppNumber.admin_id == aid)
+    contacts = select(Contact.id).where(or_(Contact.admin_id == aid, Contact.whatsapp_number_id.in_(nums)))
+    convos = select(Conversation.id).where(or_(
+        Conversation.admin_id == aid, Conversation.whatsapp_number_id.in_(nums), Conversation.contact_id.in_(contacts)))
+    campaigns = select(Campaign.id).where(or_(Campaign.admin_id == aid, Campaign.whatsapp_number_id.in_(nums)))
+
+    db.query(Message).filter(or_(Message.conversation_id.in_(convos), Message.campaign_id.in_(campaigns)))         .delete(synchronize_session=False)
+    db.query(Conversation).filter(Conversation.id.in_(convos)).delete(synchronize_session=False)
+    db.query(Campaign).filter(Campaign.id.in_(campaigns)).delete(synchronize_session=False)
+    db.query(Chatbot).filter(or_(Chatbot.admin_id == aid, Chatbot.whatsapp_number_id.in_(nums)))         .delete(synchronize_session=False)
+    db.query(Automation).filter(Automation.admin_id == aid).delete(synchronize_session=False)
+    db.query(Contact).filter(Contact.id.in_(contacts)).delete(synchronize_session=False)
+    db.query(WhatsAppNumber).filter(WhatsAppNumber.admin_id == aid).delete(synchronize_session=False)
     # Keep the audit trail; just detach the deleted user.
-    db.query(ActivityLog).filter(ActivityLog.actor_id == admin_id).update({ActivityLog.actor_id: None}, synchronize_session=False)
-    db.query(ApiKey).filter(ApiKey.updated_by == admin_id).update({ApiKey.updated_by: None}, synchronize_session=False)
+    db.query(ActivityLog).filter(ActivityLog.actor_id == aid).update({ActivityLog.actor_id: None}, synchronize_session=False)
+    db.query(ApiKey).filter(ApiKey.updated_by == aid).update({ApiKey.updated_by: None}, synchronize_session=False)
+    db.expire_all()
     db.delete(admin)
 
 
