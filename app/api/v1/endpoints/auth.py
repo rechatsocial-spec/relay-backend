@@ -5,11 +5,12 @@ from sqlalchemy.orm import Session
 from app.core.config import settings
 from app.core.google_auth import GoogleAuthError, GoogleUnavailableError, verify_google_credential
 from app.core.pages import hidden_pages_for
-from app.core.security import verify_password, create_access_token
+from app.api.deps import get_current_user
+from app.core.security import verify_password, create_access_token, hash_password
 from app.db.session import get_db
 from app.models.activity_log import ActivityLog
 from app.models.user import User, UserStatus
-from app.schemas.auth import LoginRequest, TokenResponse, GoogleLoginRequest, AuthConfigOut
+from app.schemas.auth import LoginRequest, TokenResponse, GoogleLoginRequest, AuthConfigOut, ChangePasswordRequest
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 
@@ -64,3 +65,15 @@ def login_with_google(payload: GoogleLoginRequest, db: Session = Depends(get_db)
     db.add(ActivityLog(actor_id=user.id, type="auth", message=f"{user.name} signed in with Google"))
     db.commit()
     return response
+
+
+@router.post("/change-password", status_code=status.HTTP_204_NO_CONTENT)
+def change_password(payload: ChangePasswordRequest, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    """The signed-in user changes their own password (current password required)."""
+    if not verify_password(payload.current_password, user.hashed_password):
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Current password is incorrect")
+    if payload.new_password == payload.current_password:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "New password must be different from the current one")
+    user.hashed_password = hash_password(payload.new_password)
+    db.add(ActivityLog(actor_id=user.id, type="auth", message=f"{user.name} changed their password"))
+    db.commit()

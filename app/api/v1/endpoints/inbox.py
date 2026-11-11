@@ -21,13 +21,15 @@ def _to_conversation_out(conv: Conversation, contact: Contact, number: WhatsAppN
         admin_id=conv.admin_id, status=conv.status, unread_count=conv.unread_count,
         last_message_at=conv.last_message_at, last_inbound_at=conv.last_inbound_at,
         contact=ContactSummary(id=contact.id, name=contact.name, phone=contact.phone, email=contact.email),
-        whatsapp_number_phone=number.phone,
+        whatsapp_number_phone=number.phone, whatsapp_number_name=number.display_name,
     )
 
 
 @router.get("/conversations", response_model=list[ConversationOut])
 def list_conversations(
     status_filter: ConversationStatus | None = Query(None, alias="status"),
+    number_id: uuid.UUID | None = Query(None),
+    limit: int = Query(500, ge=1, le=2000),
     db: Session = Depends(get_db),
     scope: uuid.UUID | None = Depends(admin_scope_filter),
 ):
@@ -36,7 +38,9 @@ def list_conversations(
         q = q.filter(Conversation.admin_id == scope)
     if status_filter:
         q = q.filter(Conversation.status == status_filter)
-    conversations = q.order_by(Conversation.last_message_at.desc()).all()
+    if number_id:
+        q = q.filter(Conversation.whatsapp_number_id == number_id)
+    conversations = q.order_by(Conversation.last_message_at.desc()).limit(limit).all()
 
     if not conversations:
         return []

@@ -58,6 +58,7 @@ class ConversationOut(BaseModel):
     last_inbound_at: datetime | None = None
     contact: ContactSummary
     whatsapp_number_phone: str
+    whatsapp_number_name: str | None = None
 
     class Config:
         from_attributes = True

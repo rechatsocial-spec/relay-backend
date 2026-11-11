@@ -92,7 +92,7 @@ class UnipileWhatsAppService(WhatsAppServiceInterface):
             import httpx
 
             if not settings.UNIPILE_API_KEY:
-                raise RuntimeError("UNIPILE_API_KEY must be set in .env")
+                raise RuntimeError("WhatsApp is not configured on the server (missing API key)")
             http = httpx.Client(timeout=60)
         self.http = http
 
@@ -140,7 +140,7 @@ class UnipileWhatsAppService(WhatsAppServiceInterface):
     def _send(self, from_number: str, to: str, text: str, attachments: list | None = None) -> SendResult:
         account_id = self._account_id_for(from_number)
         if not account_id:
-            return SendResult(False, None, error=f"{from_number} is not linked to Unipile — link it first",
+            return SendResult(False, None, error=f"{from_number} is not linked yet — link the number first",
                               error_code="unipile_not_linked")
         jid = f"{to_e164(to).lstrip('+')}@s.whatsapp.net"
         chat_id = self._chat_id_for(account_id, to) or jid
@@ -192,7 +192,7 @@ class UnipileWhatsAppService(WhatsAppServiceInterface):
 
     def send_template(self, from_number, to, template_id, variables=None):
         return SendResult(
-            False, None, error="Unipile WhatsApp has no approved templates — send normal text instead",
+            False, None, error="Templates are not supported for this WhatsApp connection — send normal text instead",
             error_code="template_unsupported",
         )
 

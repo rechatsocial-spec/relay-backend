@@ -24,11 +24,9 @@ class Settings(BaseSettings):
     UNIPILE_API_KEY: str = ""
     UNIPILE_BASE_URL: str = "https://api.unipile.com/v2"
     UNIPILE_WEBHOOK_SECRET: str = ""
-    # Where to send the browser after a WhatsApp account is linked (optional).
-    FRONTEND_URL: str = ""
 
     # Public https URL of this backend (e.g. https://relay-backend.onrender.com).
-    # Unipile redirects the browser here after a WhatsApp account is linked.
+    # Used to show the webhook address in the app.
     PUBLIC_BASE_URL: str = ""
 
     # Seconds between campaign messages. These are normal WhatsApp accounts, not

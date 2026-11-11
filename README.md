@@ -120,16 +120,23 @@ Code: `UnipileWhatsAppService` in `whatsapp_service.py`, routes in
 
 1. Unipile dashboard → your Application → API Keys → **Service Keys**: create one →
    `UNIPILE_API_KEY` (shown once; keys expire, rotate before the date; sent as `X-API-KEY`).
-2. Dashboard → Webhooks → add `{PUBLIC_BASE_URL}/api/v1/unipile/webhook` with events
-   `message.new`, `message.receipt.delivery`, `message.receipt.read`,
-   `account.status.*`, `account.remove`; copy its signing secret → `UNIPILE_WEBHOOK_SECRET`.
+2. Dashboard → Webhooks → add `{PUBLIC_BASE_URL}/api/v1/whatsapp/webhook` (the old
+   `/api/v1/unipile/webhook` keeps working) with events `message.new`,
+   `message.receipt.delivery`, `message.receipt.read`, `account.status.*`, `account.remove`;
+   copy its signing secret → `UNIPILE_WEBHOOK_SECRET`.
 3. Set `PUBLIC_BASE_URL`, `WHATSAPP_MOCK=false`.
-4. As Super Admin: WhatsApp Numbers → **Link via Unipile** (or `POST /api/v1/unipile/link`),
-   scan the QR code in the new tab. The number appears in the CRM.
+4. Nothing is linked from the app: connect WhatsApp numbers in the Unipile dashboard.
+   `app/services/sync.py` imports every connected WhatsApp account as a CRM number (owned
+   by the first Super Admin, who can reassign it with `PATCH /numbers/{id}`), then once per
+   number its latest 100 one-to-one chats with their last 30 messages. It re-checks for new
+   accounts every minute. After that, messages arrive through the webhook.
+5. The Inbox is unified: all numbers' chats in one list, each tagged with its number
+   (`GET /inbox/conversations`, optional `?number_id=`). Replies go out from the number the
+   chat belongs to.
 
 Limits: no templates and no 24h window (it's a normal WhatsApp account — pace
 campaigns with `CAMPAIGN_SEND_INTERVAL_SECONDS` of 5+ to avoid bans); group chats are
-ignored, and senders whose phone Unipile doesn't expose (`@lid` with no `public_identifier`) are skipped
+not imported or shown, and senders whose phone Unipile doesn't expose (`@lid` with no `public_identifier`) are skipped
 and noted in the activity log. Test without an account: `python test_unipile.py`.
 
 ### Automations on incoming chats

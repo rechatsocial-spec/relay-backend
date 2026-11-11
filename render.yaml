@@ -34,8 +34,6 @@ services:
         sync: false
       - key: CORS_ORIGINS             # JSON list, e.g. ["https://app.yourdomain.com"]
         sync: false
-      - key: FRONTEND_URL
-        sync: false
       - key: BOOTSTRAP_ADMIN_EMAIL
         sync: false
       - key: BOOTSTRAP_ADMIN_PASSWORD

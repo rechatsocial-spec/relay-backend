@@ -63,11 +63,55 @@ class FakeHttp:
 fake = FakeHttp()
 ws._unipile_singleton = ws.UnipileWhatsAppService(http=fake)
 
-# Link flow talks to Unipile with module-level httpx.post / httpx.get — fake those.
-link_calls = []
-httpx_post, httpx_get = httpx.post, httpx.get
-httpx.post = lambda url, **kw: (link_calls.append((url, kw)), httpx.Response(200, json={"link": "https://auth.unipile.com/abc"}))[1]
-httpx.get = lambda url, **kw: httpx.Response(200, json={"id": "acc_123", "name": "+91 98765 43210", "status": "running", "provider": "whatsapp"})
+# Fake provider read API: accounts, chats, messages, profiles.
+import re  # noqa: E402
+httpx_get = httpx.get
+ACCOUNTS = [
+    {"id": "acc_123", "name": "+91 98765 43210", "status": "running", "provider": "whatsapp"},
+    {"id": "acc_456", "name": "+91 91234 56789", "status": "running", "provider": "whatsapp"},
+]
+CHATS = {
+    "acc_123": [
+        {"id": "919811111111@s.whatsapp.net", "name": "Old Friend", "user_id": "919811111111@s.whatsapp.net", "unread_count": 2},
+        {"id": "555777@lid", "name": "Lid Chat", "user_id": "555777@lid", "unread_count": 0},
+        {"id": "nophone@lid", "name": "No Phone", "user_id": "nophone@lid", "unread_count": 0},
+    ],
+    "acc_456": [{"id": "919822222222@s.whatsapp.net", "name": "Second Number Customer", "user_id": "919822222222@s.whatsapp.net", "unread_count": 0}],
+}
+def _m(i, text, ts, sender=False, **kw):
+    return {"id": i, "text": text, "timestamp": ts, "is_sender": sender, "attachments": [], "sender_id": "x", **kw}
+MESSAGES = {  # newest first, like the real API
+    "919811111111@s.whatsapp.net": [
+        _m("w3", "Great, see you", "2026-11-10T10:05:00.000Z", True, is_seen=True),
+        _m("w2", "Is it still available?", "2026-11-10T10:00:00.000Z"),
+        _m("w1", "Hello", "2026-11-10T09:59:00.000Z", True, is_delivered=True),
+    ],
+    "555777@lid": [_m("l1", "Hi from a hidden-number contact", "2026-11-10T08:00:00.000Z")],
+    "nophone@lid": [_m("n1", "who am i", "2026-11-10T07:00:00.000Z")],
+    "919822222222@s.whatsapp.net": [_m("s1", "Hello second number", "2026-11-10T11:00:00.000Z")],
+}
+USERS = {"555777@lid": "+91 98111 00099"}
+
+
+def provider_get(url, params=None, **kw):
+    path = url.split("/v2", 1)[1]
+    req = httpx.Request("GET", url)
+    R = lambda code, data: httpx.Response(code, json=data, request=req)
+    if path == "/accounts":
+        return R(200, {"object": "Accounts", "data": ACCOUNTS, "has_more": False})
+    if (m := re.fullmatch(r"/(acc_\w+)/chats/(.+)/messages", path)):
+        return R(200, {"data": MESSAGES.get(m.group(2), [])})
+    if (m := re.fullmatch(r"/(acc_\w+)/chats", path)):
+        return R(200, {"data": CHATS.get(m.group(1), [])})
+    if (m := re.fullmatch(r"/(acc_\w+)/users/(.+)", path)):
+        return R(200, {"public_identifier": USERS[m.group(2)]}) if m.group(2) in USERS else R(404, {})
+    if (m := re.fullmatch(r"/accounts/(acc_\w+)", path)):
+        acc = next((x for x in ACCOUNTS if x["id"] == m.group(1)), None)
+        return R(200, acc) if acc else R(404, {})
+    return R(404, {})
+
+
+httpx.get = provider_get
 
 seed.run()
 client = TestClient(app)
@@ -86,12 +130,12 @@ def login(email):
     return {"Authorization": f"Bearer {t}"}
 
 
-def webhook(event, sign=True, ts=None):
+def webhook(event, sign=True, ts=None, path="/api/v1/whatsapp/webhook"):
     raw = json.dumps(event).encode()
     t = str(ts or int(time.time()))
     sig = hmac.new(SECRET.encode(), f"{t}.".encode() + raw, hashlib.sha256).hexdigest()
     headers = {"unipile-signature": f"t={t},v0={sig if sign else 'bad'}", "content-type": "application/json"}
-    return client.post("/api/v1/unipile/webhook", content=raw, headers=headers)
+    return client.post(path, content=raw, headers=headers)
 
 
 SA = login("deepa@relaycrm.io")
@@ -104,29 +148,62 @@ ensure_bootstrap_admin()  # idempotent
 r = client.post("/api/v1/auth/login", json={"email": "boss@example.com", "password": "boot-pass-1"})
 check(r.status_code == 200, "Bootstrap Super Admin can log in (email normalised, created once)")
 check(client.post("/api/v1/webhooks/twilio/inbound", data={"x": "1"}).status_code == 404, "Twilio webhook routes are gone")
-check(client.get("/health").json() == {"status": "ok", "whatsapp_mock": False, "whatsapp_provider": "unipile"}, "/health reports Unipile")
+check(client.get("/health").json() == {"status": "ok", "whatsapp_mock": False, "whatsapp_provider": "whatsapp"}, "/health reports live WhatsApp (no provider name)")
 
-# --- linking ------------------------------------------------------------------
-check(client.post("/api/v1/unipile/link", headers=ADMIN, json={"admin_id": rahul_id}).status_code == 403, "Only a Super Admin can start linking")
-r = client.post("/api/v1/unipile/link", headers=SA, json={"admin_id": rahul_id, "display_name": "Unipile Line"})
-body = link_calls[-1][1]["json"]
-check(r.status_code == 200 and r.json()["link"] == "https://auth.unipile.com/abc", "Link endpoint returns the Hosted Auth link")
-check(link_calls[-1][0].endswith("/auth/link") and link_calls[-1][1]["headers"]["X-API-KEY"] == "key_test", "Auth link requested with X-API-KEY")
-check(body["providers"] == "whatsapp" and body["redirect_uri"] == "https://crm.example.com/api/v1/unipile/callback", "Link request targets WhatsApp and our callback")
-state = body["state"]
+# --- nothing to link: connected accounts are imported -----------------------------
+check(all(client.request(m, f"/api/v1/whatsapp/{x}", headers=SA, json={}).status_code == 404
+          for m, x in (("POST", "link"), ("POST", "accounts"), ("GET", "callback"))), "Link / register / callback endpoints are gone")
 
-check(client.get("/api/v1/unipile/callback", params={"account_id": "acc_123", "state": "forged"}).status_code == 400, "Callback rejects a forged state")
-r = client.get("/api/v1/unipile/callback", params={"account_id": "acc_123", "state": state})
-check(r.status_code == 200 and r.json()["ok"], "Callback accepts the signed state")
+import app.services.sync as sync  # noqa: E402
+sync.PAUSE_SECONDS = 0
+from app.models.whatsapp_number import WhatsAppNumber  # noqa: E402
+before = len(client.get("/api/v1/numbers", headers=SA).json())
+with SessionLocal() as db:
+    created = sync.sync_accounts(db)
+check(len(created) == 2, "Both connected accounts become CRM numbers")
+with SessionLocal() as db:
+    check(sync.sync_accounts(db) == [], "Syncing again creates no duplicates")
 numbers = client.get("/api/v1/numbers", headers=SA).json()
-num = next((n for n in numbers if n["unipile_account_id"] == "acc_123"), None)
-check(num and num["phone"] == "+919876543210" and num["display_name"] == "Unipile Line" and num["admin_id"] == rahul_id,
-      "Callback creates the CRM number (phone from account name, owner from state)")
-r = client.post("/api/v1/unipile/accounts", headers=SA, json={"account_id": "acc_123", "admin_id": rahul_id})
-check(r.status_code == 200 and r.json()["unipile_account_id"] == "acc_123" and len(client.get("/api/v1/numbers", headers=SA).json()) == len(numbers),
-      "Registering a dashboard-linked account is idempotent (no duplicate number)")
+num = next((n for n in numbers if n["phone"] == "+919876543210"), None)
+num2 = next((n for n in numbers if n["phone"] == "+919123456789"), None)
+check(num and num2 and len(numbers) == before + 2 and num["display_name"] == "+91 98765 43210" and num["admin_id"] != rahul_id,
+      "Imported number: phone + name from the account, owned by a Super Admin")
+check(client.patch(f"/api/v1/numbers/{num['id']}", headers=SA, json={"admin_id": rahul_id}).status_code == 200
+      and client.patch(f"/api/v1/numbers/{num2['id']}", headers=SA, json={"admin_id": rahul_id}).status_code == 200,
+      "A Super Admin can hand the numbers to an Admin")
+
+with SessionLocal() as db:
+    for acc in ("acc_123", "acc_456"):
+        sync.sync_history(db, db.query(WhatsAppNumber).filter(WhatsAppNumber.unipile_account_id == acc).first())
+convs = client.get("/api/v1/inbox/conversations", headers=SA).json()
+byphone = {c["contact"]["phone"]: c for c in convs}
+check("+919811111111" in byphone and "+919822222222" in byphone, "Existing chats of BOTH numbers appear in one unified inbox")
+check("+919811100099" in byphone and byphone["+919811100099"]["contact"]["name"] == "Lid Chat", "A hidden-number (@lid) chat is resolved through the profile")
+check(not any(c["contact"]["name"] == "No Phone" for c in convs), "A chat whose phone can't be resolved is skipped")
+check({byphone["+919811111111"]["whatsapp_number_phone"], byphone["+919822222222"]["whatsapp_number_phone"]} == {"+919876543210", "+919123456789"}
+      and byphone["+919822222222"]["whatsapp_number_name"], "Each conversation says which number it belongs to")
+only = client.get("/api/v1/inbox/conversations", headers=SA, params={"number_id": num2["id"]}).json()
+check(only and all(c["whatsapp_number_id"] == num2["id"] for c in only) and len(only) < len(convs), "Filtering by number shows only that number's chats")
+stats = next(n for n in client.get("/api/v1/numbers", headers=SA).json() if n["id"] == num["id"])
+check(stats["chats"] == 2 and stats["unread"] == 2, "Numbers list shows chats + unread per number")
+d = client.get(f"/api/v1/inbox/conversations/{byphone['+919811111111']['id']}", headers=SA).json()
+check(next(n for n in client.get('/api/v1/numbers', headers=SA).json() if n['id'] == num['id'])['unread'] == 0, 'Opening a chat marks it read')
+check([m["text"] for m in d["messages"]] == ["Hello", "Is it still available?", "Great, see you"], "History is in order, oldest first")
+check([m["sender"] for m in d["messages"]] == ["business", "customer", "business"] and [m["status"] for m in d["messages"]] == ["delivered", "delivered", "read"],
+      "Sent / received and read states are kept")
+check(byphone["+919811111111"]["unread_count"] == 2, "Unread count comes from the chat")
+check(byphone["+919811111111"]["last_inbound_at"].startswith("2026-11-10T10:00"), "Last customer message time is set (reply window)")
+with SessionLocal() as db:
+    n_before = db.query(Message).count()
+    sync.sync_history(db, db.query(WhatsAppNumber).filter(WhatsAppNumber.unipile_account_id == "acc_123").first())
+    check(db.query(Message).count() == n_before, "Importing history twice does not duplicate messages")
+sync.sync_all()  # nothing pending: must be a quiet no-op
+reply = client.post(f"/api/v1/inbox/conversations/{byphone['+919822222222']['id']}/messages", headers=SA, json={"type": "text", "text": "hi from second"})
+check(fake.calls[-1]["url"].endswith("/acc_456/chats/919822222222@s.whatsapp.net/messages/send") and reply.json()["status"] == "sent",
+      "A reply goes out from the number the chat belongs to")
+
 st = client.get("/api/v1/system/whatsapp", headers=ADMIN).json()
-check(st["provider"] == "unipile" and st["credentials_set"] and st["inbound_webhook_url"].endswith("/unipile/webhook"), "/system/whatsapp reports Unipile + webhook URL")
+check(st["provider"] == "whatsapp" and st["credentials_set"] and st["inbound_webhook_url"] == "https://crm.example.com/api/v1/whatsapp/webhook", "/system/whatsapp reports live + neutral webhook URL")
 
 # --- inbound ------------------------------------------------------------------
 def inbound(mid, text="Hi, is the sale still on?", sender="919876500001@s.whatsapp.net", **extra):
@@ -185,7 +262,7 @@ check(att["content_type"] == "image/png" and att["filename"] == "offer.png" and 
       "Image downloaded and sent as base64 attachment with caption")
 
 r = client.post(f"/api/v1/inbox/conversations/{conv['id']}/messages", headers=ADMIN, json={"type": "text", "content_sid": "HX1"})
-check(r.json()["status"] == "failed" and "templates" in (r.json().get("error_message") or ""), "Templates are reported as unsupported")
+check(r.json()["status"] == "failed" and "not supported" in (r.json().get("error_message") or ""), "Templates are reported as unsupported")
 
 fake.new_chat = True
 n_before = len(fake.calls)
@@ -218,6 +295,57 @@ with SessionLocal() as db:
 
 check(webhook({"type": "message.new", "account_id": "acc_unknown", "payload": {"id": "z"}}).status_code == 200, "Events for unknown accounts are acknowledged, not errors")
 
+
+
+# --- change password -------------------------------------------------------------
+H = lambda t: {"Authorization": f"Bearer {t}"}
+tok = client.post("/api/v1/auth/login", json={"email": "boss@example.com", "password": "boot-pass-1"}).json()["access_token"]
+check(client.post("/api/v1/auth/change-password", json={"current_password": "boot-pass-1", "new_password": "newpass-2222"}).status_code == 401, "Change password requires sign-in")
+check(client.post("/api/v1/auth/change-password", headers=H(tok), json={"current_password": "wrong", "new_password": "newpass-2222"}).status_code == 400, "Wrong current password is rejected")
+check(client.post("/api/v1/auth/change-password", headers=H(tok), json={"current_password": "boot-pass-1", "new_password": "short"}).status_code == 422, "Too-short new password is rejected (min 8)")
+check(client.post("/api/v1/auth/change-password", headers=H(tok), json={"current_password": "boot-pass-1", "new_password": "boot-pass-1"}).status_code == 400, "New password must differ from the current one")
+check(client.post("/api/v1/auth/change-password", headers=H(tok), json={"current_password": "boot-pass-1", "new_password": "newpass-2222"}).status_code == 204, "Password changed")
+check(client.post("/api/v1/auth/login", json={"email": "boss@example.com", "password": "boot-pass-1"}).status_code == 401
+      and client.post("/api/v1/auth/login", json={"email": "boss@example.com", "password": "newpass-2222"}).status_code == 200, "Old password stops working, new one works")
+
+# --- live connection status ------------------------------------------------------
+import app.services.connection_status as cs  # noqa: E402
+account_status = {"acc_123": {"id": "acc_123", "status": "running", "is_locked": False}, "acc_456": {"id": "acc_456", "status": "running", "is_locked": False}}
+_prev_get = httpx.get
+def fake_account_get(url, **kw):
+    aid = url.rsplit("/", 1)[-1]
+    return httpx.Response(200, json=account_status[aid]) if aid in account_status else httpx.Response(404, json={})
+httpx.get = fake_account_get
+cs._cache.clear()
+live = client.get("/api/v1/numbers/live-status", headers=SA).json()
+mine = next(n for n in live if n["phone"] == "+919876543210")
+check(mine["connection"] == "connected" and mine["checked_at"], "Live status: running account shows connected")
+check(any(n["connection"] == "not_linked" for n in live), "Numbers without a linked account show not_linked")
+account_status["acc_123"]["status"] = "disconnected"; cs._cache.clear()
+mine = next(n for n in client.get("/api/v1/numbers/live-status", headers=SA).json() if n["phone"] == "+919876543210")
+check(mine["connection"] == "disconnected", "Live status reflects a disconnect right away")
+check(next(n for n in client.get("/api/v1/numbers", headers=SA).json() if n["phone"] == "+919876543210")["status"] == "error", "Stored number status follows the live check")
+account_status["acc_123"]["status"] = "degraded"; cs._cache.clear()
+check(next(n for n in client.get("/api/v1/numbers/live-status", headers=SA).json() if n["phone"] == "+919876543210")["connection"] == "attention", "Degraded shows needs-attention")
+httpx.get = lambda url, **kw: (_ for _ in ()).throw(httpx.ConnectError("down")); cs._cache.clear()
+check(next(n for n in client.get("/api/v1/numbers/live-status", headers=SA).json() if n["phone"] == "+919876543210")["connection"] == "unknown", "Provider unreachable shows unknown (not a false disconnect)")
+httpx.get = _prev_get
+account_status["acc_123"]["status"] = "running"; cs._cache.clear()
+httpx.get = fake_account_get
+ADMIN_LIVE = client.get("/api/v1/numbers/live-status", headers=ADMIN).json()
+check(ADMIN_LIVE and all(n["admin_id"] == rahul_id for n in ADMIN_LIVE) and len(ADMIN_LIVE) < len(client.get("/api/v1/numbers/live-status", headers=SA).json()), "An Admin only sees live status of their own numbers")
+httpx.get = _prev_get
+
+# --- neutral surface: legacy path still works, provider name never reaches the screen
+check(webhook({"type": "message.new", "account_id": "acc_unknown", "payload": {"id": "z"}}, path="/api/v1/unipile/webhook").status_code == 200, "Legacy webhook path still works (already-registered endpoints)")
+client.post("/api/v1/inbox/conversations/" + conv["id"] + "/messages", headers=ADMIN, json={"type": "text", "content_sid": "HX1"})
+logs = json.dumps(client.get("/api/v1/activity-logs", headers=SA).json())
+with SessionLocal() as db:
+    errors = " ".join(m.error_message or "" for m in db.query(Message).all())
+check("unipile" not in (logs + errors).lower(), "Activity logs and message errors never mention the provider")
+paths = " ".join(client.get("/openapi.json").json()["paths"])
+check("unipile" not in paths.lower(), "Public API docs list neutral paths only")
+check("unipile" not in json.dumps(client.get("/api/v1/numbers", headers=SA).json()).lower(), "Numbers API responses never mention the provider")
 
 # --- automations: new_customer trigger -------------------------------------------
 import app.services.automation_runner as ar  # noqa: E402
@@ -304,6 +432,6 @@ fast_forward()
 ar.process_due_runs()
 check(len(fake.calls) == n4, "Pausing the automation stops runs that are waiting")
 
-httpx.post, httpx.get = httpx_post, httpx_get
+httpx.get = httpx_get
 print(f"\n{passed} passed, {failed} failed")
 raise SystemExit(1 if failed else 0)

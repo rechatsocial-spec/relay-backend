@@ -8,13 +8,13 @@ router = APIRouter(prefix="/system", tags=["system"], dependencies=[Depends(get_
 
 @router.get("/whatsapp")
 def whatsapp_status():
-    """What the Settings page shows: is WhatsApp live (via Unipile) and the webhook URL to give Unipile."""
+    """What the Settings page shows: is WhatsApp live, and the webhook URL to register with the provider."""
     base = settings.PUBLIC_BASE_URL.rstrip("/")
     return {
-        "provider": "mock" if settings.WHATSAPP_MOCK else "unipile",
+        "provider": "mock" if settings.WHATSAPP_MOCK else "whatsapp",
         "live": not settings.WHATSAPP_MOCK,
         "credentials_set": bool(settings.UNIPILE_API_KEY and settings.UNIPILE_WEBHOOK_SECRET),
         "public_base_url": base or None,
-        "inbound_webhook_url": f"{base}{settings.API_V1_PREFIX}/unipile/webhook" if base else None,
+        "inbound_webhook_url": f"{base}{settings.API_V1_PREFIX}/whatsapp/webhook" if base else None,
         "send_interval_seconds": settings.CAMPAIGN_SEND_INTERVAL_SECONDS,
     }

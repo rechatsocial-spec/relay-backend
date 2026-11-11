@@ -26,6 +26,8 @@ class WhatsAppNumber(Base):
     phone_number_id: Mapped[str | None] = mapped_column(String(120), nullable=True)
     # Unipile account id ("acc_…") of the linked WhatsApp session, if any.
     unipile_account_id: Mapped[str | None] = mapped_column(String(120), nullable=True, index=True)
+    # Set once the existing chats of this account have been imported.
+    history_synced_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     admin_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("users.id"))
     status: Mapped[NumberStatus] = mapped_column(Enum(NumberStatus, name="number_status"), default=NumberStatus.ACTIVE)
 
