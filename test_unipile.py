@@ -107,19 +107,30 @@ MESSAGES = {  # newest first, like the real API
 USERS = {"555777@lid": "+91 98111 00099"}
 
 
-PROVIDER = {"all_fail": None, "list_fail": None}
+PROVIDER = {"all_fail": None, "list_fail": None, "body": {"detail": "nope"}}
+KEYS_USED = []
+VISIBLE_FOR_KEY = {}   # key -> account ids that key can see (a Scoped key sees one scope only)
+ENDPOINTS = []
+DELIVERIES = []
 
 
 def provider_get(url, params=None, **kw):
     path = url.split("/v2", 1)[1]
     req = httpx.Request("GET", url)
     R = lambda code, data: httpx.Response(code, json=data, request=req)
+    KEYS_USED.append((path, (kw.get("headers") or {}).get("X-API-KEY")))
     if PROVIDER["all_fail"]:
-        return R(PROVIDER["all_fail"], {"detail": "nope"})
+        return R(PROVIDER["all_fail"], PROVIDER["body"])
+    if path.startswith("/webhooks/endpoints"):
+        return R(200, {"object": "WebhookEndpoints", "data": ENDPOINTS, "has_more": False})
+    if path.startswith("/webhooks/conversations"):
+        return R(200, {"object": "WebhookConversations", "data": DELIVERIES, "has_more": False})
     if path == "/accounts" and PROVIDER["list_fail"]:
         return R(PROVIDER["list_fail"], {"detail": "not allowed"})
     if path == "/accounts":
-        return R(200, {"object": "Accounts", "data": ACCOUNTS, "has_more": False})
+        key = (kw.get("headers") or {}).get("X-API-KEY")
+        shown = [a for a in ACCOUNTS if a["id"] in VISIBLE_FOR_KEY[key]] if key in VISIBLE_FOR_KEY else ACCOUNTS
+        return R(200, {"object": "Accounts", "data": shown, "has_more": False})
     if (m := re.fullmatch(r"/(acc_\w+)/chats/(.+)/messages", path)):
         return R(200, {"data": MESSAGES.get(m.group(2), [])})
     if (m := re.fullmatch(r"/(acc_\w+)/chats", path)):
@@ -661,7 +672,7 @@ check("401" in client.get("/api/v1/system/whatsapp", headers=SA).json()["sync"][
 PROVIDER["all_fail"] = None
 PROVIDER["list_fail"] = 403
 rep = sync.refresh_now()
-check(rep["ok"] is False and "403" in rep["error"] and "UNIPILE_ACCOUNT_IDS" in rep["error"], "A key that cannot list accounts says what to do")
+check(rep["ok"] is False and "403" in rep["error"] and "Service Key" in rep["error"] and "UNIPILE" not in rep["error"], "A key that cannot list accounts says what to do (without naming settings)")
 settings.UNIPILE_ACCOUNT_IDS = "acc_123, acc_456, acc_789"
 rep = sync.refresh_now()
 check(rep["ok"] is True and rep["accounts_found"] == 3, "...and listing the account ids by hand is enough")
@@ -1052,6 +1063,179 @@ fake.user_chats["919800123456@s.whatsapp.net"] = "chat_found_77"
 res = svc.send_text("+919876543210", "+919800123456", "chat exists")
 check(res.success and fake.calls[-1]["url"] == "https://api.unipile.com/v2/acc_123/chats/chat_found_77/messages/send", "...and reuses the chat Unipile says already exists, whatever its id looks like")
 fake.user_chats.clear()
+
+# --- "Check connection": why texts might not arrive --------------------------------------
+import app.api.v1.endpoints.unipile as _unip  # noqa: E402
+from app.services import webhook_stats as _wh  # noqa: E402
+OUR_URL = "https://crm.example.com/api/v1/whatsapp/webhook"
+GOOD_EVENTS = ["message.new", "message.receipt.delivery", "message.receipt.read", "account.status.disconnected", "account.remove"]
+def good_endpoint(**kw):
+    return {"object": "WebhookEndpoint", "id": "we_1", "url": OUR_URL, "enabled": True, "trigger_events": list(GOOD_EVENTS), "account_ids": [], "secret": SECRET, **kw}
+def deliveries(*codes):
+    return [{"object": "WebhookConversation", "id": f"wc_{i}", "endpoint_id": "we_1", "http_status": c, "first_attempt": True} for i, c in enumerate(codes)]
+def _route_post(url, content=None, headers=None, timeout=None, **kw):
+    if url.startswith("https://crm.example.com"):
+        rr = client.post(url.replace("https://crm.example.com", ""), content=content, headers=headers)
+        return httpx.Response(rr.status_code, content=rr.content, request=httpx.Request("POST", url))
+    raise httpx.ConnectError("blocked")
+_real_post = httpx.post
+httpx.post = _route_post
+def check_conn(h=SA):
+    r = client.post("/api/v1/system/connection-check", headers=h)
+    return r, {c["key"]: c for c in (r.json().get("checks", []) if r.status_code == 200 else [])}
+settings.UNIPILE_ACCOUNT_IDS = ""
+PROVIDER["all_fail"] = PROVIDER["list_fail"] = None
+ACCOUNTS[:] = [a for a in ACCOUNTS if a["id"] in ("acc_123", "acc_456", "acc_789")]
+for a in ACCOUNTS:
+    a["status"] = "running"
+
+for _k in ("rejected_signature", "rejected_stale", "unknown_account"):
+    _wh.STATS[_k] = 0      # a clean server: nothing refused yet
+_wh.STATS["last_rejected_at"] = None
+ENDPOINTS[:] = [good_endpoint()]; DELIVERIES[:] = deliveries(200, 200, 200)
+recv_before = _wh.STATS["received"]
+r, c = check_conn()
+check(r.status_code == 200 and r.json()["webhook_url"] == OUR_URL and all(x["status"] in ("ok", "warn") for x in c.values()), "Healthy setup: every check passes", str({k: v["status"] for k, v in c.items() if v["status"] not in ("ok",)}))
+check(all(c[k]["status"] == "ok" for k in ("live", "key", "address", "endpoint", "events", "coverage", "secretmatch", "deliveries")), "...key, address, endpoint, events, coverage, secret and deliveries each reported OK")
+check(_wh.STATS["selftest_at"] and _wh.STATS["received"] == recv_before, "The signed self-test reached the endpoint but is not counted as a real notification")
+check("SECRET" not in json.dumps(r.json()) and SECRET not in json.dumps(r.json()), "The secret is never shown")
+check(client.post("/api/v1/system/connection-check", headers=ADMIN).status_code == 403, "Only a Super Admin can run it")
+
+ENDPOINTS[:] = [good_endpoint(url="https://elsewhere.example.org/hook")]
+r, c = check_conn()
+check(c["endpoint"]["status"] == "fail" and "elsewhere.example.org" in c["endpoint"]["detail"] and OUR_URL in c["endpoint"]["fix"], "No endpoint at this server's address: says what exists and the exact address to add")
+ENDPOINTS[:] = [good_endpoint(enabled=False, trigger_events=["email.new"], account_ids=["acc_123"], secret="something-else")]
+r, c = check_conn()
+check(c["endpoint"]["status"] == "fail" and "switched off" in c["endpoint"]["detail"], "A disabled endpoint is flagged")
+check(c["events"]["status"] == "fail" and "message.new" in c["events"]["detail"], "An endpoint not subscribed to new messages is flagged (texts would never be announced)")
+check(c["coverage"]["status"] == "fail" and "Not covered" in c["coverage"]["detail"], "An endpoint limited to some accounts names the numbers it misses")
+check(c["secretmatch"]["status"] == "fail" and "DIFFERENT" in c["secretmatch"]["detail"] and "something-else" not in json.dumps(r.json()), "A secret that differs from the server's is flagged, without revealing either")
+ENDPOINTS[:] = [good_endpoint()]; DELIVERIES[:] = deliveries(200, 403, 403, None, 200)
+r, c = check_conn()
+check(c["deliveries"]["status"] == "fail" and "HTTP 403 x2" in c["deliveries"]["detail"] and "timeout" in c["deliveries"]["detail"], "Failing deliveries are summarised (HTTP 403 means a secret mismatch, no answer means a timeout)")
+DELIVERIES[:] = []
+r, c = check_conn()
+check(c["deliveries"]["status"] == "warn", "No delivery attempts yet is a warning, not an error")
+ACCOUNTS[1]["status"] = "disconnected"
+r, c = check_conn()
+check(c["acc:acc_456"]["status"] == "fail" and "Not connected" in c["acc:acc_456"]["detail"] and c["acc:acc_123"]["status"] == "ok", "A disconnected number is named")
+ACCOUNTS[1]["status"] = "running"
+
+PROVIDER["all_fail"] = 401
+r, c = check_conn()
+check(r.status_code == 200 and c["key"]["status"] == "fail" and "401" in c["key"]["detail"] and c["endpoint"]["status"] == "warn", "A rejected key is reported and the rest still runs")
+PROVIDER["all_fail"] = None
+httpx.post = lambda *a, **k: (_ for _ in ()).throw(httpx.ConnectError("down"))
+r, c = check_conn()
+check(c["address"]["status"] == "fail" and "Could not reach" in c["address"]["detail"], "An address the server cannot reach is flagged")
+httpx.post = _route_post
+_ps = settings.PUBLIC_BASE_URL; settings.PUBLIC_BASE_URL = ""
+r, c = check_conn()
+check(c["address"]["status"] == "fail" and "public address is not set" in c["address"]["detail"], "A missing public address is flagged")
+settings.PUBLIC_BASE_URL = _ps
+
+# what the endpoint itself has seen
+bad_before = _wh.STATS["rejected_signature"]
+webhook({"type": "message.new", "account_id": "acc_123", "payload": {"id": "zz"}}, sign=False)
+check(_wh.STATS["rejected_signature"] == bad_before + 1 and _wh.STATS["last_rejected_at"], "Notifications with a wrong signature are counted")
+_unip._last_import[0] = __import__("time").time()   # keep the background import out of this test
+unk = _wh.STATS["unknown_account"]
+webhook({"type": "message.new", "account_id": "acc_zzz", "payload": {"id": "zz2"}})
+check(_wh.STATS["unknown_account"] == unk + 1 and _wh.STATS["last_unknown_account"] == "acc_zzz", "A notification for a number that is not imported is remembered, not silently dropped")
+sysw = client.get("/api/v1/system/whatsapp", headers=SA).json()
+check(sysw["webhook"]["received"] >= 1 and sysw["webhook"]["last_type"] == "message.new" and client.get("/api/v1/system/whatsapp", headers=ADMIN).json()["webhook"] is None,
+      "The status shows the Super Admin when notifications last arrived (Admins don't see it)")
+r, c = check_conn()
+check(c["seen"]["status"] == "ok" and c["rejected"]["status"] == "fail" and c["unknown"]["status"] == "warn", "The check reports what the server really received and refused")
+httpx.post = _real_post
+
+# --- "Retrieve messages": pull the latest now, from the Inbox, any role ---------------
+_far = (_dt.now(_tz.utc) + _td3(minutes=5)).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+MESSAGES["919811111111@s.whatsapp.net"].insert(0, _m("ret_1", "Missed by every notification", _far))   # the chat's own timestamp is left stale on purpose
+thread_texts = lambda: [m["text"] for m in client.get(f"/api/v1/inbox/conversations/{byphone['+919811111111']['id']}", headers=SA).json()["messages"]]
+check("Missed by every notification" not in thread_texts(), "(setup) a message exists at the service that the app has not seen")
+r = client.post("/api/v1/inbox/retrieve", headers=SA).json()
+check(r["ok"] and r["new_messages"] == 1 and r["chats"] == 1 and r["numbers"] >= 3 and not r["errors"] and "Missed by every notification" in thread_texts(),
+      "Retrieve messages finds it and puts it in the chat", str(r))
+r = client.post("/api/v1/inbox/retrieve", headers=SA).json()
+check(r["ok"] and r["new_messages"] == 0, "...and pressing again finds nothing new (no duplicates)", str(r))
+check(client.post("/api/v1/inbox/retrieve", headers=other_h).json()["numbers"] == 0, "An Admin without numbers retrieves nothing (only their own numbers are read)")
+mine_n = client.post("/api/v1/inbox/retrieve", headers=ADMIN).json()
+check(mine_n["ok"] and 1 <= mine_n["numbers"] <= 3, "An Admin retrieves for their own numbers", str(mine_n))
+check(client.post(f"/api/v1/inbox/retrieve?number_id={num2['id']}", headers=other_h).status_code == 404, "...and cannot ask for a number that is not theirs")
+only_one = client.post(f"/api/v1/inbox/retrieve?number_id={num['id']}", headers=SA).json()
+check(only_one["numbers"] == 1, "One number can be retrieved on its own (the Inbox button follows the number filter)")
+PROVIDER["all_fail"] = 401
+bad = client.post("/api/v1/inbox/retrieve", headers=SA).json()
+check(bad["ok"] and bad["errors"] and "401" in bad["errors"][0]["error"] and "UNIPILE" not in bad["errors"][0]["error"], "When the service refuses, each number's error is reported in plain words")
+PROVIDER["all_fail"] = None
+sync._work_lock.acquire()
+busy = sync.retrieve_recent_messages(None, wait_seconds=0.1)
+sync._work_lock.release()
+check(busy["ok"] and busy["busy"] and "already being loaded" in busy["message"], "If a background load is running it says so instead of colliding with it")
+_key = settings.UNIPILE_API_KEY; settings.UNIPILE_API_KEY = ""
+off = client.post("/api/v1/inbox/retrieve", headers=SA).json()
+settings.UNIPILE_API_KEY = _key
+check(off["ok"] is False and "not connected" in off["error"] and "UNIPILE" not in off["error"], "Without an API key it says WhatsApp is not connected")
+check(client.post("/api/v1/inbox/retrieve").status_code == 401, "It needs a sign-in")
+
+# --- two separate keys: API key for chats and sending, Service Key for webhook settings ----
+def _settings_with(env):
+    saved = {k: os.environ.pop(k) for k in list(os.environ) if k.upper().startswith("UNIPILE") and k.upper() not in ("UNIPILE_BASE_URL",)}
+    os.environ.update(env)
+    try:
+        return Settings(_env_file=None)
+    finally:
+        for k in env:
+            os.environ.pop(k, None)
+        os.environ.update(saved)
+both = _settings_with({"UNIPILE_API_KEY": "api_one", "UNIPILE_SERVICE_KEY": "svc_two"})
+check(both.UNIPILE_API_KEY == "api_one" and both.UNIPILE_SERVICE_KEY == "svc_two" and both.management_key == "svc_two",
+      "With both set they stay separate: the API key is the API key, the Service Key manages webhook settings")
+only_api = _settings_with({"UNIPILE_API_KEY": "api_one"})
+check(only_api.UNIPILE_SERVICE_KEY == "" and only_api.management_key == "api_one", "Without a Service Key, webhook settings are read with the API key")
+only_svc = _settings_with({"UNIPILE_SERVICE_KEY": "svc_two"})
+check(only_svc.UNIPILE_API_KEY == "svc_two" and only_svc.management_key == "svc_two", "A Service Key alone is used for everything (it can do all an API key can)")
+check(_settings_with({"UNIPILE_API_KEY": '  "quoted_key" \n', "UNIPILE_SERVICE_KEY": " svc \n"}).UNIPILE_API_KEY == "quoted_key", "Spaces, line breaks and quotes pasted around a key are removed")
+check(_settings_with({"UNIPILE_SERVICE_KEY": "x", "WHATSAPP_MOCK": "true"}).WHATSAPP_MOCK is False and _settings_with({}).UNIPILE_API_KEY == "", "A key always forces live mode; no key stays empty")
+settings.UNIPILE_SERVICE_KEY = "svc_test"; KEYS_USED.clear()
+httpx.post = _route_post
+ENDPOINTS[:] = [good_endpoint()]; DELIVERIES[:] = deliveries(200)
+check_conn()
+hook_keys = {k for pth, k in KEYS_USED if pth.startswith("/webhooks")}
+acct_keys = {k for pth, k in KEYS_USED if pth == "/accounts"}
+check(hook_keys == {"svc_test"} and "key_test" in acct_keys, "Check connection reads webhook settings with the Service Key and still reads accounts with the API key", f"{hook_keys} {acct_keys}")
+settings.UNIPILE_SERVICE_KEY = ""; KEYS_USED.clear()
+check_conn()
+check({k for pth, k in KEYS_USED if pth.startswith("/webhooks")} == {"key_test"}, "...and falls back to the API key when no Service Key is saved")
+httpx.post = _real_post
+_k = settings.UNIPILE_API_KEY; settings.UNIPILE_API_KEY = ""
+os.environ["UNIPILE_SERVICE_KEYY"] = "typo"
+rr = client.post("/api/v1/system/connection-check", headers=SA).json()
+del os.environ["UNIPILE_SERVICE_KEYY"]; settings.UNIPILE_API_KEY = _k
+live_c = rr["checks"][0]
+check(live_c["status"] == "fail" and "UNIPILE_SERVICE_KEYY" in live_c["detail"] and "UNIPILE_API_KEY" in live_c["fix"], "With no key, the connection check lists settings with a similar name so a misnamed one is obvious")
+
+# --- the API-keys page: expired keys and Scoped keys ------------------------------------
+PROVIDER["all_fail"] = 401; PROVIDER["body"] = {"type": "api/expired_authorization", "title": "Expired"}
+exp = sync.refresh_now()
+check(exp["ok"] is False and "EXPIRED" in exp["error"] and "replacement" in exp["error"] and "UNIPILE" not in exp["error"], "An expired key (401 api/expired_authorization) is named as expired, with what to do")
+PROVIDER["body"] = {"detail": "nope"}
+plain = sync.refresh_now()
+check("EXPIRED" not in plain["error"] and "rejected" in plain["error"], "...while an ordinary 401 still says the key was rejected")
+PROVIDER["all_fail"] = None
+settings.UNIPILE_SERVICE_KEY = "svc_test"; VISIBLE_FOR_KEY["key_test"] = ["acc_123"]
+httpx.post = _route_post
+ENDPOINTS[:] = [good_endpoint()]; DELIVERIES[:] = deliveries(200)
+r, c = check_conn()
+check(c["scope"]["status"] == "fail" and "1 of 3 accounts" in c["scope"]["detail"] and "Scoped" in c["scope"]["detail"], "A Scoped API key that only sees some numbers is caught and the hidden numbers are named")
+VISIBLE_FOR_KEY.clear()
+r, c = check_conn()
+check(c["scope"]["status"] == "ok", "With a key that sees every number, that check passes")
+settings.UNIPILE_SERVICE_KEY = ""
+r, c = check_conn()
+check("scope" not in c, "(no Service Key saved: nothing to compare with, so the check is skipped)")
+httpx.post = _real_post
 
 # --- demo-data cleanup ------------------------------------------------------------
 from app.services.demo_cleanup import purge_demo_data  # noqa: E402

@@ -186,6 +186,17 @@ Each message step shows its text on the flow with **Write message** and **+ Add 
   reads every chat of every number again from Unipile (deletes nothing, adds no duplicates); a number that says it was
   imported but holds no chats is imported again automatically.
 
+### "Texts don't arrive": Check connection
+
+Super Admin -> WhatsApp Numbers -> **Check connection** (`POST /system/connection-check`) uses the server's own key to verify,
+in plain words: the key works and which accounts it sees and whether each is connected; the public address and webhook secret
+are set and the server's own signed test message gets through; the webhook endpoint registered at the service exists, is
+enabled, listens for new messages, covers every number and has the **same secret** as the server (compared, never shown);
+what the service's delivery log says about recent notifications (HTTP 403 = secret differs, no answer = timeout, the service
+waits 5 s); and what this server actually received or refused. The page also shows when the last live notification arrived.
+A notification for an account that is not a number yet makes the server import accounts immediately instead of dropping it.
+Even if the webhook fails entirely, the one-minute catch-up still brings texts in.
+
 ### Which chats are imported, and people WhatsApp hides
 
 Only one-to-one chats with people are customers. WhatsApp's own system chat (`0@s.whatsapp.net`, which showed up as

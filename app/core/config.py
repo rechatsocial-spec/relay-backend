@@ -1,4 +1,4 @@
-from pydantic import model_validator
+from pydantic import field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -22,7 +22,12 @@ class Settings(BaseSettings):
     # the Unipile dashboard > API Keys, sent as X-API-KEY. Keys expire — rotate
     # before the expiry date. UNIPILE_WEBHOOK_SECRET: signing secret of the webhook
     # endpoint you create there. Both are passwords — environment only.
+    # UNIPILE_API_KEY: the key the app uses for chats, messages and sending.
+    # UNIPILE_SERVICE_KEY: a separate Service Key, used only to read the webhook settings and delivery log in
+    # "Check connection" (only a Service Key may manage webhooks). Optional; if it is the only key set, it is used for
+    # everything. Both are passwords: environment only.
     UNIPILE_API_KEY: str = ""
+    UNIPILE_SERVICE_KEY: str = ""
     UNIPILE_BASE_URL: str = "https://api.unipile.com/v2"
     UNIPILE_WEBHOOK_SECRET: str = ""
     # Only needed if the API key is not allowed to list accounts: "acc_1,acc_2,..."
@@ -69,12 +74,25 @@ class Settings(BaseSettings):
     # on a public deployment needlessly widens the attack surface.
     CORS_ORIGINS: list[str] = ["*"]
 
+    @field_validator("UNIPILE_API_KEY", "UNIPILE_SERVICE_KEY", "UNIPILE_WEBHOOK_SECRET", mode="before")
+    @classmethod
+    def _clean_secret(cls, v):
+        # pasted values often carry a trailing space/newline or surrounding quotes
+        return v.strip().strip("\"'").strip() if isinstance(v, str) else v
+
     @model_validator(mode="after")
     def _live_when_configured(self):
         # A real API key means real data. A stray WHATSAPP_MOCK=true must not keep a live system in demo mode.
+        if not self.UNIPILE_API_KEY and self.UNIPILE_SERVICE_KEY:
+            self.UNIPILE_API_KEY = self.UNIPILE_SERVICE_KEY  # a Service Key can do everything the API key can
         if self.UNIPILE_API_KEY and self.WHATSAPP_MOCK:
             self.WHATSAPP_MOCK = False
         return self
+
+    @property
+    def management_key(self) -> str:
+        """The key for webhook settings: the Service Key if there is one, else the API key."""
+        return self.UNIPILE_SERVICE_KEY or self.UNIPILE_API_KEY
 
 
 settings = Settings()

@@ -13,6 +13,7 @@ from app.models.whatsapp_number import WhatsAppNumber
 from app.services.whatsapp_service import get_whatsapp_service, WhatsAppServiceInterface
 from app.core.config import settings
 from app.services.audio import to_ogg_opus
+from app.services.sync import retrieve_recent_messages
 from app.services.media import stored_url
 from app.models.media import MediaFile
 from app.services.messaging import send_attachment_message, send_message as deliver_message
@@ -159,3 +160,21 @@ def send_attachment(
     db.commit()
     db.refresh(message)
     return message
+
+
+@router.post("/retrieve")
+def retrieve_messages(
+    number_id: uuid.UUID | None = None,
+    db: Session = Depends(get_db), scope: uuid.UUID | None = Depends(admin_scope_filter),
+):
+    """Pulls the latest messages from the WhatsApp service now (own numbers for an Admin, all for a Super Admin).
+    Live messages normally arrive by themselves; this is the manual 'Retrieve messages' button."""
+    q = db.query(WhatsAppNumber.id)
+    if scope:
+        q = q.filter(WhatsAppNumber.admin_id == scope)
+    if number_id:
+        q = q.filter(WhatsAppNumber.id == number_id)
+    ids = [r[0] for r in q.all()]
+    if number_id and not ids:
+        raise HTTPException(404, "Number not found")
+    return retrieve_recent_messages(ids)

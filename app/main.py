@@ -43,8 +43,15 @@ def on_startup():
     upgrade_schema(engine)  # adds new columns to existing tables (dev convenience)
     ensure_bootstrap_admin()
     cleanup_demo_data_on_start()  # removes the demo seed; real numbers and chats are never touched
+    import os
+
+    seen = sorted(k for k in os.environ if k.upper().startswith("UNIPILE"))
+    log = logging.getLogger("relay")
+    log.warning("WhatsApp settings found on this server: %s", ", ".join(seen) or "none")
     if not settings.WHATSAPP_MOCK and not settings.UNIPILE_API_KEY:
-        logging.getLogger("relay").error("WhatsApp is live but UNIPILE_API_KEY is not set — nothing can be sent or imported")
+        log.error("WhatsApp is live but no API key was found (set UNIPILE_API_KEY) — nothing can be sent or imported")
+    if not settings.UNIPILE_WEBHOOK_SECRET:
+        log.error("No webhook secret was found (set UNIPILE_WEBHOOK_SECRET) — every incoming-message notification will be refused")
     threading.Thread(target=warn_default_passwords, daemon=True).start()  # bcrypt checks: keep startup fast
     resume_interrupted_campaigns()
     start_sync_loop()  # imports connected WhatsApp accounts and their recent chats

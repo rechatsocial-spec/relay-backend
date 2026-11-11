@@ -50,11 +50,11 @@ STATE = {"last_run_at": None, "last_ok_at": None, "error": None, "accounts_found
 _work_lock = threading.Lock()
 
 
-def _get(path: str, params: dict | None = None) -> dict:
+def _get(path: str, params: dict | None = None, key: str | None = None) -> dict:
     for attempt in (1, 2):
         r = httpx.get(
             settings.UNIPILE_BASE_URL.rstrip("/") + path, params=params, timeout=30,
-            headers={"X-API-KEY": settings.UNIPILE_API_KEY, "accept": "application/json"},
+            headers={"X-API-KEY": key or settings.UNIPILE_API_KEY, "accept": "application/json"},
         )
         if r.status_code == 429 and attempt == 1:  # rate limited: wait once, then retry
             time.sleep(5)
@@ -68,10 +68,13 @@ def explain(exc: Exception) -> str:
     """A sentence a person can act on."""
     if isinstance(exc, httpx.HTTPStatusError):
         code = exc.response.status_code
+        if code == 401 and "expired" in (exc.response.text or "").lower():
+            return ("The service answered 401: the API key has EXPIRED (every key has an expiry date). Create a replacement "
+                    "with the same access in the service's dashboard, save it on the server, and delete the old one.")
         hint = {
-            401: "the API key was rejected — check UNIPILE_API_KEY",
-            403: "this key may not list accounts — use a Service Key, or set UNIPILE_ACCOUNT_IDS",
-            404: "address or account not found — check UNIPILE_BASE_URL / the account ids",
+            401: "the API key was rejected — check the key set on the server",
+            403: "this key may not list accounts — use a Service Key, or list the account ids on the server",
+            404: "address or account not found — check the service address and the account ids on the server",
             429: "rate limited — it will retry",
         }.get(code, "the request failed")
         return f"The WhatsApp service answered {code}: {hint}"
@@ -100,11 +103,11 @@ def _configured_ids() -> list[str]:
     return [i.strip() for i in settings.UNIPILE_ACCOUNT_IDS.split(",") if i.strip()]
 
 
-def list_accounts() -> list[dict]:
+def list_accounts(key: str | None = None) -> list[dict]:
     accounts, offset = [], 0
     try:
         while True:
-            body = _get("/accounts", {"provider": "whatsapp", "limit": 100, "offset": offset})
+            body = _get("/accounts", {"provider": "whatsapp", "limit": 100, "offset": offset}, key=key)
             data = body.get("data") or body.get("items") or []
             accounts += data
             if not body.get("has_more") or not data:
@@ -331,24 +334,66 @@ def sync_history(db: Session, number: WhatsAppNumber) -> int:
     return imported
 
 
-def sync_recent(db: Session, number: WhatsAppNumber) -> int:
-    """Catch-up: re-reads only the chats whose last message is newer than what we have."""
+def _recent(db: Session, number: WhatsAppNumber, force_top: int = 0) -> tuple[int, int]:
+    """Re-reads recent chats. A chat is re-read when its last message is newer than what we have; the `force_top`
+    most recent chats are always re-read (used by 'Retrieve messages' so nothing hides behind a missing date).
+    Returns (chats that changed, new messages)."""
     known = {cid: last for cid, last in db.query(Conversation.provider_chat_id, Conversation.last_message_at).filter(
         Conversation.whatsapp_number_id == number.id, Conversation.provider_chat_id.isnot(None))}
-    changed = 0
-    for chat in _list_chats(number.unipile_account_id, CHAT_PAGE):
+    chats_changed = new_messages = 0
+    for i, chat in enumerate(_list_chats(number.unipile_account_id, CHAT_PAGE)):
         ts = _ts(chat.get("last_message_timestamp") or (chat.get("last_message") or {}).get("timestamp"))
         last = known.get(chat.get("id"))
-        if last is not None and (ts is None or ts <= _aware(last)):
+        if i >= force_top and last is not None and (ts is None or ts <= _aware(last)):
             continue  # known chat with nothing newer (or no date to compare): leave it to the webhook
         try:
-            if _import_chat(db, number, chat):
-                changed += 1
+            added = _import_chat(db, number, chat)
+            if added:
+                chats_changed += 1
+                new_messages += added
             db.commit()
         except Exception:
             db.rollback()
             log.exception("Could not refresh chat %s of %s", chat.get("id"), number.phone)
-    return changed
+    return chats_changed, new_messages
+
+
+def sync_recent(db: Session, number: WhatsAppNumber) -> int:
+    """Catch-up: re-reads only the chats whose last message is newer than what we have."""
+    return _recent(db, number)[0]
+
+
+def retrieve_recent_messages(number_ids: list | None, wait_seconds: float = 20, max_seconds: float = 55, force_top: int = 6) -> dict:
+    """'Retrieve messages': asks the service for the latest messages of these numbers right now and says what it found.
+    number_ids=None means every connected number."""
+    if not _is_live():
+        return {"ok": False, "error": "WhatsApp is not connected on the server: the API key is missing."}
+    if not _work_lock.acquire(timeout=wait_seconds):
+        return {"ok": True, "busy": True, "numbers": 0, "chats": 0, "new_messages": 0, "errors": [],
+                "message": "Messages are already being loaded in the background. Try again in a moment."}
+    db = SessionLocal()
+    started = time.time()
+    result = {"ok": True, "busy": False, "numbers": 0, "chats": 0, "new_messages": 0, "errors": []}
+    try:
+        q = db.query(WhatsAppNumber).filter(WhatsAppNumber.unipile_account_id.isnot(None))
+        if number_ids is not None:
+            q = q.filter(WhatsAppNumber.id.in_(number_ids))
+        for n in q.order_by(WhatsAppNumber.created_at).all():
+            if time.time() - started > max_seconds:
+                result["errors"].append({"number": n.display_name, "error": "Ran out of time before this number. Press again."})
+                continue
+            try:
+                chats, msgs = _recent(db, n, force_top=force_top)
+                result["numbers"] += 1
+                result["chats"] += chats
+                result["new_messages"] += msgs
+            except Exception as e:
+                db.rollback()
+                result["errors"].append({"number": n.display_name, "error": explain(e)})
+        return result
+    finally:
+        db.close()
+        _work_lock.release()
 
 
 # ───────────────────────────── orchestration
@@ -365,7 +410,7 @@ def _accounts_step() -> dict:
         created = sync_accounts(db)
         if STATE["accounts_found"] == 0:
             STATE["error"] = ("Connected to the WhatsApp service, but it lists no WhatsApp accounts for this API key. Make sure the key belongs "
-                              "to the application that has your accounts, and is a Service Key (or set UNIPILE_ACCOUNT_IDS).")
+                              "to the application that has your accounts, and is a Service Key (or list the account ids on the server).")
             return {"ok": False, "error": STATE["error"], "accounts_found": 0}
         STATE.update(error=None, last_ok_at=utcnow().isoformat())
         return {"ok": True, "created": len(created), "accounts_found": STATE["accounts_found"]}
@@ -423,7 +468,7 @@ def refresh_now(full: bool = False) -> dict:
     full=True also marks every number as not yet imported, so all its chats are read again from the service
     (nothing is deleted; messages already here are matched by id and skipped)."""
     if not _is_live():
-        return {"ok": False, "error": "WhatsApp is not live: set UNIPILE_API_KEY (and WHATSAPP_MOCK must not be true)."}
+        return {"ok": False, "error": "WhatsApp is not connected on the server: the API key is missing."}
     report = _accounts_step()
     if full and report["ok"]:
         db = SessionLocal()

@@ -31,6 +31,7 @@ from app.models.conversation import Conversation, ConversationStatus, Message, M
 from app.models.whatsapp_number import NumberStatus, WhatsAppNumber
 from app.services.automation_runner import start_keyword_automations, start_new_customer_automations
 from app.services.chat_utils import attachment_fields, digits_to_phone, find_contact, is_person_chat, lid_placeholder, phone_from_user_id
+from app.services import webhook_stats as wh
 from app.services.messaging import get_or_create_conversation, utcnow
 from app.services.sync import _aware, _ts
 
@@ -59,7 +60,7 @@ ACCOUNT_STATUS = {
 
 def _headers() -> dict:
     if not settings.UNIPILE_API_KEY:
-        raise HTTPException(503, "UNIPILE_API_KEY is not configured")
+        raise HTTPException(503, "WhatsApp is not configured on the server (API key missing)")
     return {"X-API-KEY": settings.UNIPILE_API_KEY, "accept": "application/json"}
 
 
@@ -71,14 +72,18 @@ def _api(path: str) -> str:
 
 def _verify_signature(raw: bytes, header: str) -> None:
     if not settings.UNIPILE_WEBHOOK_SECRET:
-        raise HTTPException(503, "UNIPILE_WEBHOOK_SECRET is not configured")
+        raise HTTPException(503, "The webhook secret is not set on the server")
     parts = dict(p.split("=", 1) for p in header.split(",") if "=" in p)
     t, sig = parts.get("t", ""), parts.get("v0", "")
     if not t.isdigit() or abs(time.time() - int(t)) > SIGNATURE_TOLERANCE_SECONDS:
+        wh.bump("rejected_stale")
+        wh.note(last_rejected_at=wh.now_iso())
         raise HTTPException(403, "Stale or missing signature timestamp")
     expected = hmac.new(settings.UNIPILE_WEBHOOK_SECRET.encode(), f"{t}.".encode() + raw, hashlib.sha256).hexdigest()
     if not hmac.compare_digest(expected, sig):
-        log.warning("Rejected Unipile webhook with bad signature")
+        wh.bump("rejected_signature")
+        wh.note(last_rejected_at=wh.now_iso())
+        log.warning("Rejected webhook with a bad signature (is the secret the same on both sides?)")
         raise HTTPException(403, "Invalid webhook signature")
 
 
@@ -93,7 +98,7 @@ def _resolve_phone(number: WhatsAppNumber, m: dict) -> str | None:
     if phone or not sender_id or not number.unipile_account_id:
         return phone
     try:
-        r = httpx.get(_api(f"/{number.unipile_account_id}/users/{sender_id}"), headers=_headers(), timeout=15)
+        r = httpx.get(_api(f"/{number.unipile_account_id}/users/{sender_id}"), headers=_headers(), timeout=3)
         if r.status_code < 300:
             return digits_to_phone(r.json().get("public_identifier"))
     except (httpx.HTTPError, HTTPException, ValueError):
@@ -110,7 +115,7 @@ def _store_own_message(db: Session, number: WhatsAppNumber, m: dict, chat_id: st
         phone = phone_from_user_id(chat_id)
         if not phone:
             try:
-                r = httpx.get(_api(f"/{number.unipile_account_id}/users/{chat_id}"), headers=_headers(), timeout=15)
+                r = httpx.get(_api(f"/{number.unipile_account_id}/users/{chat_id}"), headers=_headers(), timeout=3)
                 phone = digits_to_phone(r.json().get("public_identifier")) if r.status_code < 300 else None
             except (httpx.HTTPError, HTTPException, ValueError):
                 phone = None
@@ -253,10 +258,19 @@ async def unipile_webhook(request: Request, db: Session = Depends(get_db)):
     etype = event.get("type", "")
     payload = event.get("payload") or {}
     account_id = event.get("account_id")
+    if etype == "connection.test":  # the app's own "Check connection" self-test: proves signature + address work
+        wh.note(selftest_at=wh.now_iso())
+        return Response(status_code=200)
+    wh.bump("received")
+    wh.note(last_at=wh.now_iso(), last_type=etype, last_account=account_id)
     number = db.query(WhatsAppNumber).filter(WhatsAppNumber.unipile_account_id == account_id).first() if account_id else None
 
     if not number:
-        log.info("Unipile event %s for unknown account %s", etype, account_id)
+        # an account we have not imported yet (just connected?): remember it and import accounts right away
+        log.warning("Webhook event %s for an account that is not imported yet (%s): importing accounts now", etype, account_id)
+        wh.bump("unknown_account")
+        wh.note(last_unknown_account=account_id)
+        _import_accounts_soon()
         return Response(status_code=200)
 
     if etype == "message.new":
@@ -275,3 +289,18 @@ async def unipile_webhook(request: Request, db: Session = Depends(get_db)):
         number.status = NumberStatus.INACTIVE
         db.commit()
     return Response(status_code=200)
+
+
+_last_import = [0.0]
+
+
+def _import_accounts_soon() -> None:
+    """At most once a minute: read the connected accounts in the background so a new account becomes a number."""
+    import threading
+
+    from app.services import sync as _sync
+
+    if time.time() - _last_import[0] < 60 or not _sync._is_live():
+        return
+    _last_import[0] = time.time()
+    threading.Thread(target=lambda: (_sync._accounts_step(), _sync._chats_step()), daemon=True, name="accounts-from-webhook").start()
