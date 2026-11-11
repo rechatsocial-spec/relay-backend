@@ -34,6 +34,7 @@ from app.core.config import settings
 from app.db.session import SessionLocal
 from app.models.automation import Automation, AutomationRun, AutomationStatus
 from app.models.contact import Contact
+from app.models.user import Role, User
 from app.models.conversation import Conversation, ConversationStatus, Message, MessageSender, MessageStatus, MessageType
 from app.models.whatsapp_number import WhatsAppNumber
 from app.services.messaging import send_message, utcnow
@@ -64,11 +65,18 @@ def _personalize(text: str, contact: Contact) -> str:
     return text.replace("{{name}}", first).replace("{{full_name}}", contact.name or "")
 
 
+def _owner_ids(db: Session, number: WhatsAppNumber) -> list:
+    """Whose automations apply to this number: its admin's, and any Super Admin's (a number is imported under a Super
+    Admin and may later be assigned to an Admin; an automation made by a Super Admin must still answer its customers)."""
+    supers = [i for (i,) in db.query(User.id).filter(User.role == Role.SUPER_ADMIN)]
+    return list({number.admin_id, *supers})
+
+
 def start_new_customer_automations(db: Session, number: WhatsAppNumber, contact: Contact, conv: Conversation) -> int:
     """Queues a run per Running `new_customer` automation. Does not commit. Returns how many."""
     autos = (
         db.query(Automation)
-        .filter(Automation.admin_id == number.admin_id, Automation.trigger_type == "new_customer",
+        .filter(Automation.admin_id.in_(_owner_ids(db, number)), Automation.trigger_type == "new_customer",
                 Automation.status == AutomationStatus.RUNNING)
         .all()
     )
@@ -95,7 +103,7 @@ def start_keyword_automations(db: Session, number: WhatsAppNumber, contact: Cont
         return 0
     autos = (
         db.query(Automation)
-        .filter(Automation.admin_id == number.admin_id, Automation.trigger_type == "keyword", Automation.status == AutomationStatus.RUNNING)
+        .filter(Automation.admin_id.in_(_owner_ids(db, number)), Automation.trigger_type == "keyword", Automation.status == AutomationStatus.RUNNING)
         .all()
     )
     now = utcnow()

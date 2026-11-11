@@ -6,7 +6,7 @@ from sqlalchemy.orm import Session
 from app.api.deps import admin_scope_filter, get_current_user
 from app.db.session import get_db
 from app.models.user import User
-from app.models.automation import Automation
+from app.models.automation import Automation, AutomationRun
 from app.models.activity_log import ActivityLog
 from app.core.automation_templates import TEMPLATES, flow_of, get_template, starts_when, steps_of, trigger_of
 from app.schemas.automation import (
@@ -67,3 +67,16 @@ def update_automation(automation_id: uuid.UUID, payload: AutomationUpdate, db: S
     db.commit()
     db.refresh(automation)
     return automation
+
+
+@router.delete("/{automation_id}", status_code=204)
+def delete_automation(automation_id: uuid.UUID, db: Session = Depends(get_db), user: User = Depends(get_current_user), scope: uuid.UUID | None = Depends(admin_scope_filter)):
+    """Deletes an automation and its run history. Messages it already sent stay in the chats."""
+    automation = db.get(Automation, automation_id)
+    if not automation or (scope and automation.admin_id != scope):
+        raise HTTPException(404, "Automation not found")
+    name = automation.name
+    db.query(AutomationRun).filter(AutomationRun.automation_id == automation.id).delete(synchronize_session=False)
+    db.delete(automation)
+    db.add(ActivityLog(actor_id=user.id, type="automation", message=f"{user.name} deleted automation \"{name}\""))
+    db.commit()
