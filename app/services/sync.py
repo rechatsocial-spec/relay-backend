@@ -304,6 +304,8 @@ def _list_chats(acc: str, wanted: int) -> list[dict]:
             params["cursor"] = cursor
         body = _get(f"/{acc}/chats", params)
         data = body.get("data") or []
+        if not data and not cursor:  # nothing came back at all: say what the service actually answered
+            log.warning("Chat list for %s is empty. Response keys: %s; first 300 chars: %s", acc, sorted(body.keys()), str(body)[:300])
         chats += data
         cursor = body.get("next_cursor")
         if not cursor or not data:
@@ -327,10 +329,13 @@ def sync_history(db: Session, number: WhatsAppNumber) -> int:
         time.sleep(PAUSE_SECONDS)  # stay well inside the provider's rate limits
     # Mostly failed (rate limit, outage)? Leave it unmarked so the next round retries —
     # already-imported messages are skipped, so a retry is cheap.
-    if failed <= max(2, len(chats) // 5):
+    if not chats:
+        # An empty list is not "done": the account may still be syncing at the service. Retry next cycle.
+        log.warning("No chats returned for %s; will try again next cycle", number.phone)
+    elif failed <= max(2, len(chats) // 5):
         number.history_synced_at = utcnow()
         db.commit()
-    log.warning("Imported %s chats for %s (%s failed)", imported, number.phone, failed)
+    log.warning("Imported %s chats for %s (%s listed, %s failed)", imported, number.phone, len(chats), failed)
     return imported
 
 
