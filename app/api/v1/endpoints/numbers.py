@@ -16,6 +16,7 @@ from app.models.activity_log import ActivityLog
 from app.schemas.whatsapp_number import WhatsAppNumberCreate, WhatsAppNumberUpdate, WhatsAppNumberOut
 from app.services.connection_status import live_statuses
 from app.services.stats import number_stats
+from app.services.sync import refresh_now
 
 router = APIRouter(prefix="/numbers", tags=["whatsapp-numbers"])
 
@@ -51,6 +52,13 @@ def list_numbers(
             **real.get(n.id, {"messages_today": 0, "delivery_rate": 0.0, "reply_rate": 0.0}),
         }))
     return out
+
+
+@router.post("/refresh", dependencies=[Depends(require_super_admin)])
+def refresh_numbers():
+    """Reads the connected WhatsApp accounts right now and returns what happened (including the error, if any).
+    Chats are imported in the background."""
+    return refresh_now()
 
 
 @router.get("/live-status")

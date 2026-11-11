@@ -1,3 +1,4 @@
+from pydantic import model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -24,19 +25,24 @@ class Settings(BaseSettings):
     UNIPILE_API_KEY: str = ""
     UNIPILE_BASE_URL: str = "https://api.unipile.com/v2"
     UNIPILE_WEBHOOK_SECRET: str = ""
+    # Only needed if the API key is not allowed to list accounts: "acc_1,acc_2,..."
+    UNIPILE_ACCOUNT_IDS: str = ""
 
     # Public https URL of this backend (e.g. https://relay-backend.onrender.com).
     # Used to show the webhook address in the app.
     PUBLIC_BASE_URL: str = ""
 
+    # Largest file that can be sent from the inbox.
+    MAX_UPLOAD_MB: int = 16
+
     # Seconds between campaign messages. These are normal WhatsApp accounts, not
     # the official Business API — keep this at 5+ to protect numbers from bans.
     CAMPAIGN_SEND_INTERVAL_SECONDS: float = 5.0
 
-    # One-time cleanup of the demo seed (see app/services/demo_cleanup.py): set true,
-    # deploy once, then remove it. PURGE_KEEP_EMAILS = comma list of demo-domain
-    # accounts to keep.
-    PURGE_DEMO_DATA: bool = False
+    # The demo seed is removed automatically at startup (app/services/demo_cleanup.py).
+    # Only a developer machine that runs on the demo data sets KEEP_DEMO_DATA=true.
+    # PURGE_KEEP_EMAILS = comma list of demo-domain accounts to keep.
+    KEEP_DEMO_DATA: bool = False
     PURGE_KEEP_EMAILS: str = ""
 
     # Optional first Super Admin, created on startup if that email doesn't exist
@@ -57,6 +63,13 @@ class Settings(BaseSettings):
     # internet — CORS is not a substitute for auth, but an open CORS policy
     # on a public deployment needlessly widens the attack surface.
     CORS_ORIGINS: list[str] = ["*"]
+
+    @model_validator(mode="after")
+    def _live_when_configured(self):
+        # A real API key means real data. A stray WHATSAPP_MOCK=true must not keep a live system in demo mode.
+        if self.UNIPILE_API_KEY and self.WHATSAPP_MOCK:
+            self.WHATSAPP_MOCK = False
+        return self
 
 
 settings = Settings()

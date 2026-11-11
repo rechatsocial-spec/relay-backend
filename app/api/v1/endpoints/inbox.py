@@ -1,6 +1,8 @@
 import uuid
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+import mimetypes
+
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile
 from sqlalchemy.orm import Session, joinedload
 
 from app.api.deps import admin_scope_filter
@@ -9,7 +11,11 @@ from app.models.conversation import Conversation, Message, MessageSender, Messag
 from app.models.contact import Contact
 from app.models.whatsapp_number import WhatsAppNumber
 from app.services.whatsapp_service import get_whatsapp_service, WhatsAppServiceInterface
-from app.services.messaging import send_message as deliver_message
+from app.core.config import settings
+from app.services.audio import to_ogg_opus
+from app.services.media import stored_url
+from app.models.media import MediaFile
+from app.services.messaging import send_attachment_message, send_message as deliver_message
 from app.schemas.conversation import ConversationOut, ConversationDetailOut, SendMessageRequest, MessageOut, ContactSummary
 
 router = APIRouter(prefix="/inbox", tags=["inbox"])
@@ -99,6 +105,55 @@ def send_message(
         msg_type=payload.type, text=payload.text, media_url=payload.media_url,
         duration_seconds=payload.duration_seconds,
         content_sid=payload.content_sid, content_variables=payload.content_variables,
+    )
+    conv.status = ConversationStatus.HUMAN
+    db.commit()
+    db.refresh(message)
+    return message
+
+
+@router.post("/conversations/{conversation_id}/attachments", response_model=MessageOut)
+def send_attachment(
+    conversation_id: uuid.UUID,
+    file: UploadFile = File(...),
+    caption: str = Form(""),
+    voice: bool = Form(False),
+    duration: int | None = Form(None),
+    db: Session = Depends(get_db), scope: uuid.UUID | None = Depends(admin_scope_filter),
+    whatsapp: WhatsAppServiceInterface = Depends(get_whatsapp_service),
+):
+    """Send a photo / video / document / voice note picked or recorded in the inbox."""
+    conv = db.get(Conversation, conversation_id)
+    if not conv or (scope and conv.admin_id != scope):
+        raise HTTPException(404, "Conversation not found")
+    contact = db.get(Contact, conv.contact_id)
+    if contact.opted_out:
+        raise HTTPException(400, f"{contact.name} replied STOP and has opted out of WhatsApp messages")
+
+    limit = settings.MAX_UPLOAD_MB * 1024 * 1024
+    data = file.file.read(limit + 1)
+    if not data:
+        raise HTTPException(400, "The file is empty")
+    if len(data) > limit:
+        raise HTTPException(413, f"The file is larger than {settings.MAX_UPLOAD_MB} MB")
+    filename = (file.filename or "file").replace("/", "_").replace("\\", "_")[:200]
+    content_type = (file.content_type or mimetypes.guess_type(filename)[0] or "application/octet-stream").split(";")[0].strip().lower()
+
+    if voice:
+        if content_type not in ("audio/ogg", "audio/opus"):
+            converted = to_ogg_opus(data)  # WhatsApp voice notes are Ogg/Opus
+            if converted:
+                data, content_type, filename = converted, "audio/ogg", filename.rsplit(".", 1)[0] + ".ogg"
+        if not content_type.startswith("audio/"):
+            raise HTTPException(400, "A voice note must be audio")
+
+    stored = MediaFile(filename=filename, content_type=content_type, size=len(data), data=data)
+    db.add(stored)
+    db.flush()
+    number = db.get(WhatsAppNumber, conv.whatsapp_number_id)
+    message = send_attachment_message(
+        db, whatsapp, number=number, contact=contact, conversation=conv, data=data, content_type=content_type,
+        filename=filename, caption=caption.strip() or None, voice_note=voice, duration=duration, media_url=stored_url(stored.id),
     )
     conv.status = ConversationStatus.HUMAN
     db.commit()

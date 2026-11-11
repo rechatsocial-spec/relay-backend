@@ -13,6 +13,8 @@ class MessageOut(BaseModel):
     type: MessageType
     text: str | None
     media_url: str | None
+    media_name: str | None = None
+    media_type: str | None = None
     duration_seconds: int | None
     status: MessageStatus
     error_code: str | None = None

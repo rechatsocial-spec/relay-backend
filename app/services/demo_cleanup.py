@@ -1,17 +1,17 @@
 """
-One-time cleanup of the demo seed (`python -m app.seed`), keeping everything real.
+Removes the demo seed (`python -m app.seed`), keeping everything real. Runs automatically at startup.
 
-Demo =
-  - users whose email ends with @relaycrm.io (the seed's accounts), except PURGE_KEEP_EMAILS
-  - numbers that were never connected to the WhatsApp service (the seed's 47 fake numbers)
-    and everything attached to them: chats, messages, contacts, campaigns, chatbots
-  - automations / API keys / log lines created by demo users in the seed (within minutes of
-    the demo accounts being created)
-Real numbers (connected accounts), their chats and contacts are KEPT: whatever a demo
-user owned is handed to the first real Super Admin before the demo users are deleted.
+Two separate steps, so you can never be locked out:
 
-Safety: nothing happens unless a real (non-demo) Super Admin exists, so you can't lock yourself
-out. Use dry_run=True (or `python -m app.purge_demo` without --yes) to see the counts first.
+  DATA   (always)  the seed's fake numbers — never connected, owned by a demo user, created with the
+                   seed — and everything attached to them (chats, messages, contacts, campaigns,
+                   chatbots), plus the seed's automations, API keys and log lines.
+  LOGINS (only if a real, non-demo Super Admin exists)  what the demo users still own moves to that
+                   Super Admin, then the demo users (@relaycrm.io, password "password123") are deleted.
+
+Connected numbers and their chats are never touched. Rows you created yourself later are never matched:
+"created with the seed" means within a few minutes of the demo accounts being created.
+Use dry_run=True (or `python -m app.purge_demo` without --yes) to see the counts first.
 """
 import logging
 from datetime import datetime, timedelta, timezone
@@ -55,17 +55,14 @@ def purge_demo_data(db: Session, keep_emails=(), dry_run: bool = True) -> dict:
         return report
     demo_ids = {u.id for u in demo}
     owners = sorted((u for u in users if u.role == Role.SUPER_ADMIN and u.id not in demo_ids), key=lambda u: _aware(u.created_at))
-    if not owners:
-        report["error"] = "No real Super Admin exists. Set BOOTSTRAP_ADMIN_EMAIL / BOOTSTRAP_ADMIN_PASSWORD first, then retry."
-        return report
-    owner = owners[0]
-    report["new_owner"] = owner.email
+    owner = owners[0] if owners else None
+    report["new_owner"] = owner.email if owner else None
 
     seed_start = min(_aware(u.created_at) for u in demo)
-    seed_end = seed_start + SEED_WINDOW
-    in_seed = lambda dt: dt is not None and seed_start - SEED_WINDOW <= _aware(dt) <= seed_end
+    in_seed = lambda dt: dt is not None and seed_start - SEED_WINDOW <= _aware(dt) <= seed_start + SEED_WINDOW
 
-    demo_numbers = _ids(db.query(WhatsAppNumber.id).filter(WhatsAppNumber.unipile_account_id.is_(None)).all())
+    demo_numbers = [n.id for n in db.query(WhatsAppNumber).filter(WhatsAppNumber.unipile_account_id.is_(None),
+                                                                  WhatsAppNumber.admin_id.in_(demo_ids)).all() if in_seed(n.created_at)]
     conv_ids = _ids(db.query(Conversation.id).filter(Conversation.whatsapp_number_id.in_(demo_numbers)).all()) if demo_numbers else []
     contact_ids = _ids(db.query(Contact.id).filter(Contact.whatsapp_number_id.in_(demo_numbers)).all()) if demo_numbers else []
     campaign_ids = _ids(db.query(Campaign.id).filter(Campaign.whatsapp_number_id.in_(demo_numbers)).all()) if demo_numbers else []
@@ -79,28 +76,31 @@ def purge_demo_data(db: Session, keep_emails=(), dry_run: bool = True) -> dict:
     n["messages"] = delete(Message, Message.conversation_id.in_(conv_ids)) if conv_ids else 0
     if campaign_ids:
         db.query(Message).filter(Message.campaign_id.in_(campaign_ids)).update({Message.campaign_id: None}, synchronize_session=False)
-    if conv_ids or contact_ids or auto_ids:
-        for cond in ([AutomationRun.conversation_id.in_(conv_ids)] if conv_ids else []) + \
-                    ([AutomationRun.contact_id.in_(contact_ids)] if contact_ids else []) + \
-                    ([AutomationRun.automation_id.in_(auto_ids)] if auto_ids else []):
-            delete(AutomationRun, cond)
+    for ids, col in ((conv_ids, AutomationRun.conversation_id), (contact_ids, AutomationRun.contact_id), (auto_ids, AutomationRun.automation_id)):
+        if ids:
+            delete(AutomationRun, col.in_(ids))
     n["conversations"] = delete(Conversation, Conversation.id.in_(conv_ids)) if conv_ids else 0
     n["contacts"] = delete(Contact, Contact.id.in_(contact_ids)) if contact_ids else 0
     n["campaigns"] = delete(Campaign, Campaign.id.in_(campaign_ids)) if campaign_ids else 0
     n["chatbots"] = delete(Chatbot, Chatbot.whatsapp_number_id.in_(demo_numbers)) if demo_numbers else 0
     n["automations"] = delete(Automation, Automation.id.in_(auto_ids)) if auto_ids else 0
     n["api_keys"] = delete(ApiKey, ApiKey.id.in_(key_ids)) if key_ids else 0
-    n["activity_logs"] = delete(ActivityLog, ActivityLog.actor_id.in_(demo_ids))
     n["numbers"] = delete(WhatsAppNumber, WhatsAppNumber.id.in_(demo_numbers)) if demo_numbers else 0
 
-    # whatever real data a demo user still owns moves to the real Super Admin
-    moved = {}
-    for model, col in ((WhatsAppNumber, "admin_id"), (Contact, "admin_id"), (Conversation, "admin_id"), (Chatbot, "admin_id"),
-                       (Campaign, "admin_id"), (Automation, "admin_id"), (ApiKey, "updated_by")):
-        c = getattr(model, col)
-        moved[model.__tablename__] = db.query(model).filter(c.in_(demo_ids)).update({c: owner.id}, synchronize_session=False)
-    n["users"] = delete(User, User.id.in_(demo_ids))
-    report.update(deleted=n, reassigned_to_owner={k: v for k, v in moved.items() if v})
+    if owner:
+        n["activity_logs"] = delete(ActivityLog, ActivityLog.actor_id.in_(demo_ids))
+        moved = {}
+        for model, col in ((WhatsAppNumber, "admin_id"), (Contact, "admin_id"), (Conversation, "admin_id"), (Chatbot, "admin_id"),
+                           (Campaign, "admin_id"), (Automation, "admin_id"), (ApiKey, "updated_by")):
+            c = getattr(model, col)
+            moved[model.__tablename__] = db.query(model).filter(c.in_(demo_ids)).update({c: owner.id}, synchronize_session=False)
+        n["users"] = delete(User, User.id.in_(demo_ids))
+        report["reassigned_to_owner"] = {k: v for k, v in moved.items() if v}
+    else:
+        n["users"] = 0
+        report["warning"] = ("The demo data is removed, but the demo logins (password123) are kept because no real Super Admin exists yet. "
+                             "Set BOOTSTRAP_ADMIN_EMAIL / BOOTSTRAP_ADMIN_PASSWORD, redeploy, and they are removed too.")
+    report["deleted"] = n
 
     if dry_run:
         db.rollback()
@@ -109,17 +109,19 @@ def purge_demo_data(db: Session, keep_emails=(), dry_run: bool = True) -> dict:
     return report
 
 
-def purge_if_requested() -> None:
-    """Startup hook: runs the cleanup once when PURGE_DEMO_DATA=true."""
-    if not settings.PURGE_DEMO_DATA:
+def cleanup_demo_data_on_start() -> None:
+    """Startup hook: removes the demo seed (unless KEEP_DEMO_DATA=true, for developer machines)."""
+    if settings.KEEP_DEMO_DATA:
         return
     db = SessionLocal()
     try:
         report = purge_demo_data(db, settings.PURGE_KEEP_EMAILS.split(","), dry_run=False)
-        if report["error"]:
-            log.error("Demo cleanup skipped: %s", report["error"])
+        if report.get("note"):
+            return  # nothing demo left
+        if report.get("warning"):
+            log.warning("Demo cleanup: %s %s", report["deleted"], report["warning"])
         else:
-            log.warning("Demo cleanup done: %s — remove PURGE_DEMO_DATA now", report)
+            log.warning("Demo cleanup done: %s", report)
     except Exception:
         db.rollback()
         log.exception("Demo cleanup failed (nothing was changed)")

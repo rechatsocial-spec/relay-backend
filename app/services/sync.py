@@ -1,19 +1,24 @@
 """
-Imports what is already connected at the WhatsApp provider, so nothing has to be
-linked or added by hand:
+Pulls what is connected at the WhatsApp service into the CRM, so nothing has to be linked by hand:
 
-  1. every WhatsApp account  -> a CRM number (owned by the first Super Admin;
-     a Super Admin can reassign it to an Admin)
+  1. every WhatsApp account  -> a CRM number (owned by the first real Super Admin;
+     a Super Admin can assign it to an Admin)
   2. once per number, its most recent 1:1 chats and their latest messages
      -> contacts, conversations and messages (the unified inbox)
+  3. every cycle (SYNC_SECONDS), chats that changed since the last look are re-read, so the
+     inbox keeps up even if a webhook delivery is missed
 
-After that, live messages arrive through the webhook (endpoints/unipile.py).
-Runs in a background thread: once at startup, then every SYNC_SECONDS (picks up
-newly connected accounts). Imports are idempotent (messages are matched by id).
+Live events arrive through the webhook (endpoints/unipile.py); this module is the catch-up.
+Imports are idempotent (messages are matched by id). `STATE` records the last run and the last
+error so the app can show *why* nothing arrived (see /system/whatsapp and POST /numbers/refresh).
+
+If the key is not allowed to list accounts, put the account ids in UNIPILE_ACCOUNT_IDS
+(comma separated, "acc_...") and they are read one by one.
 """
 import logging
 import threading
 import time
+import uuid
 from datetime import datetime, timezone
 
 import httpx
@@ -25,7 +30,7 @@ from app.models.contact import Contact, ContactStatus
 from app.models.conversation import Conversation, Message, MessageSender, MessageStatus, MessageType
 from app.models.user import Role, User
 from app.models.whatsapp_number import NumberStatus, WhatsAppNumber
-from app.services.chat_utils import digits_to_phone, find_contact, message_type, phone_from_user_id
+from app.services.chat_utils import attachment_fields, digits_to_phone, find_contact, phone_from_user_id
 from app.services.connection_status import _MAP
 from app.services.messaging import get_or_create_conversation, utcnow
 
@@ -33,9 +38,13 @@ log = logging.getLogger("relay.sync")
 
 SYNC_SECONDS = 60
 CHAT_PAGE = 50
-MAX_CHATS = 100          # per number
+MAX_CHATS = 100          # per number, first import
 MESSAGES_PER_CHAT = 30
 PAUSE_SECONDS = 0.2
+
+STATE = {"last_run_at": None, "last_ok_at": None, "error": None, "accounts_found": 0, "imported_chats": 0, "history_importing": False,
+         "application_id": None}
+_work_lock = threading.Lock()
 
 
 def _get(path: str, params: dict | None = None) -> dict:
@@ -52,6 +61,22 @@ def _get(path: str, params: dict | None = None) -> dict:
     return r.json()
 
 
+def explain(exc: Exception) -> str:
+    """A sentence a person can act on."""
+    if isinstance(exc, httpx.HTTPStatusError):
+        code = exc.response.status_code
+        hint = {
+            401: "the API key was rejected — check UNIPILE_API_KEY",
+            403: "this key may not list accounts — use a Service Key, or set UNIPILE_ACCOUNT_IDS",
+            404: "address or account not found — check UNIPILE_BASE_URL / the account ids",
+            429: "rate limited — it will retry",
+        }.get(code, "the request failed")
+        return f"The WhatsApp service answered {code}: {hint}"
+    if isinstance(exc, httpx.HTTPError):
+        return f"Could not reach the WhatsApp service ({exc.__class__.__name__})"
+    return f"{exc.__class__.__name__}: {str(exc)[:160]}"
+
+
 def _ts(value: str | None) -> datetime | None:
     if not value:
         return None
@@ -66,44 +91,78 @@ def _aware(dt: datetime | None) -> datetime | None:
     return dt.replace(tzinfo=timezone.utc) if dt is not None and dt.tzinfo is None else dt  # SQLite is naive
 
 
+# ───────────────────────────── accounts -> numbers
+
+def _configured_ids() -> list[str]:
+    return [i.strip() for i in settings.UNIPILE_ACCOUNT_IDS.split(",") if i.strip()]
+
+
+def list_accounts() -> list[dict]:
+    accounts, offset = [], 0
+    try:
+        while True:
+            body = _get("/accounts", {"provider": "whatsapp", "limit": 100, "offset": offset})
+            data = body.get("data") or body.get("items") or []
+            accounts += data
+            if not body.get("has_more") or not data:
+                break
+            offset += len(data)
+    except httpx.HTTPStatusError as e:
+        if e.response.status_code in (401, 403, 404) and _configured_ids():
+            accounts = []  # listing not allowed: fall back to the ids that were listed by hand
+        else:
+            raise
+    have = {a.get("id") for a in accounts}
+    for aid in _configured_ids():
+        if aid not in have:
+            accounts.append(_get(f"/accounts/{aid}"))
+    return [a for a in accounts if a.get("id") and a.get("provider") in (None, "whatsapp")]
+
+
+def _account_phone(a: dict) -> str | None:
+    """The account's own phone number: its user id (a WhatsApp JID), else digits in its name."""
+    return phone_from_user_id(a.get("user_id") or "") or digits_to_phone(a.get("name"))
+
+
 def sync_accounts(db: Session) -> list[WhatsAppNumber]:
     """Makes sure every connected WhatsApp account is a CRM number. Returns the new ones."""
     supers = db.query(User).filter(User.role == Role.SUPER_ADMIN).order_by(User.created_at).all()
     owner = next((u for u in supers if not u.email.lower().endswith("@relaycrm.io")), supers[0] if supers else None)  # not the demo account
     if not owner:
-        log.warning("No Super Admin exists yet — cannot import numbers")
-        return []
-    accounts, offset = [], 0
-    while True:
-        body = _get("/accounts", {"provider": "whatsapp", "limit": 100, "offset": offset})
-        data = body.get("data") or []
-        accounts += data
-        if not body.get("has_more") or not data:
-            break
-        offset += len(data)
+        raise RuntimeError("No Super Admin exists yet — cannot import numbers")
+    accounts = list_accounts()
+    STATE["accounts_found"] = len(accounts)
+    STATE["application_id"] = next((a.get("application_id") for a in accounts if a.get("application_id")), STATE["application_id"])
 
     created = []
     for a in accounts:
-        aid = a.get("id")
-        if not aid:
-            continue
-        phone = digits_to_phone(a.get("name")) or aid[:30]
+        aid = a["id"]
+        phone = _account_phone(a)
+        name = (a.get("name") or "").strip()
+        label = name or phone or aid
         status = _MAP.get(a.get("status"), ("", NumberStatus.ACTIVE))[1]
         number = db.query(WhatsAppNumber).filter(WhatsAppNumber.unipile_account_id == aid).first()
-        if not number:
-            number = db.query(WhatsAppNumber).filter(WhatsAppNumber.phone == phone).first()
+        if not number and phone:
+            number = db.query(WhatsAppNumber).filter(WhatsAppNumber.phone == phone, WhatsAppNumber.unipile_account_id.is_(None)).first()
         if number:
             number.unipile_account_id = aid
+            if phone and number.phone != phone and not db.query(WhatsAppNumber).filter(WhatsAppNumber.phone == phone).first():
+                if number.display_name == number.phone:
+                    number.display_name = label[:120]
+                number.phone = phone  # was a placeholder until the real number was known
             if number.status != NumberStatus.INACTIVE:
                 number.status = status
         else:
-            number = WhatsAppNumber(phone=phone, display_name=(a.get("name") or phone)[:120], unipile_account_id=aid,
-                                    admin_id=owner.id, status=status)
+            taken = phone and db.query(WhatsAppNumber).filter(WhatsAppNumber.phone == phone).first()
+            number = WhatsAppNumber(phone=(phone if phone and not taken else aid[:30]), display_name=label[:120],
+                                    unipile_account_id=aid, admin_id=owner.id, status=status)
             db.add(number)
             created.append(number)
     db.commit()
     return created
 
+
+# ───────────────────────────── chats -> contacts, conversations, messages
 
 def _phone_for_chat(account_id: str, chat: dict) -> str | None:
     user_id = chat.get("user_id") or chat.get("id") or ""
@@ -116,14 +175,15 @@ def _phone_for_chat(account_id: str, chat: dict) -> str | None:
         return None
 
 
-def _import_chat(db: Session, number: WhatsAppNumber, chat: dict) -> bool:
+def _import_chat(db: Session, number: WhatsAppNumber, chat: dict) -> int:
+    """Imports one chat. Returns how many messages were new."""
     chat_id = chat.get("id")
     acc = number.unipile_account_id
     if not chat_id:
-        return False
+        return 0
     phone = _phone_for_chat(acc, chat)
     if not phone:
-        return False
+        return 0
     messages = (_get(f"/{acc}/chats/{chat_id}/messages", {"limit": MESSAGES_PER_CHAT}).get("data")) or []
     items = []
     for m in messages:
@@ -134,12 +194,11 @@ def _import_chat(db: Session, number: WhatsAppNumber, chat: dict) -> bool:
             continue
         items.append((ts, m))
     if not items:
-        return False
+        return 0
     items.sort(key=lambda x: x[0])
 
     contact = find_contact(db, number, phone)
-    is_new_contact = contact is None
-    if is_new_contact:
+    if contact is None:
         contact = Contact(
             name=(chat.get("name") or phone)[:120], phone=phone, whatsapp_number_id=number.id, admin_id=number.admin_id,
             status=ContactStatus.REPLIED if any(not m.get("is_sender") for _, m in items) else ContactStatus.CONTACTED,
@@ -155,43 +214,56 @@ def _import_chat(db: Session, number: WhatsAppNumber, chat: dict) -> bool:
         is_new_conv = not conv.messages
         conv.provider_chat_id = chat_id
     existing = {pid for (pid,) in db.query(Message.provider_message_id).filter(Message.conversation_id == conv.id) if pid}
+    batch_ids = {m["id"] for _, m in items}
+    # messages we sent from this app: same text, same moment, but possibly stored under another id
+    unmatched_out = [m for m in db.query(Message).filter(Message.conversation_id == conv.id, Message.sender == MessageSender.BUSINESS,
+                                                           Message.type != MessageType.NOTE).all()
+                     if m.provider_message_id not in batch_ids]
 
-    last_any, last_in = None, None
+    last_any, last_in, new_inbound, added = None, None, 0, 0
     for ts, m in items:
         last_any = ts
         if not m.get("is_sender"):
             last_in = ts
         if m["id"] in existing:
             continue
+        if m.get("is_sender"):
+            twin = next((x for x in unmatched_out if (x.text or "") == (m.get("text") or "")
+                         and abs((_aware(x.created_at) - ts).total_seconds()) < 180), None)
+            if twin is not None:  # the same message, already shown: just adopt the service's id
+                unmatched_out.remove(twin)
+                twin.provider_message_id = m["id"]
+                continue
         atts = m.get("attachments") or []
         first = atts[0] if atts else None
-        mtype = MessageType.TEXT
-        if first:
-            mtype = MessageType.STICKER if (first.get("type") == "img" and first.get("sticker")) else message_type(first.get("mimetype"))
         if m.get("is_sender"):
             sender = MessageSender.BUSINESS
             status = MessageStatus.READ if m.get("is_seen") else MessageStatus.DELIVERED if m.get("is_delivered") else MessageStatus.SENT
         else:
             sender, status = MessageSender.CUSTOMER, MessageStatus.DELIVERED
-        db.add(Message(conversation_id=conv.id, sender=sender, type=mtype, text=m.get("text") or None,
-                       media_url=(first or {}).get("url"), status=status, provider_message_id=m["id"], created_at=ts))
+            new_inbound += 1
+        mid = uuid.uuid4()
+        fields = {"type": MessageType.TEXT, **attachment_fields(first, mid)}
+        db.add(Message(id=mid, conversation_id=conv.id, sender=sender, text=m.get("text") or None,
+                       status=status, provider_message_id=m["id"], created_at=ts, **fields))
+        added += 1
 
     if last_any and (conv.last_message_at is None or is_new_conv or last_any > _aware(conv.last_message_at)):
         conv.last_message_at = last_any
     if last_in and (conv.last_inbound_at is None or last_in > _aware(conv.last_inbound_at)):
         conv.last_inbound_at = last_in
+    if new_inbound and not is_new_conv:
+        conv.unread_count = (conv.unread_count or 0) + new_inbound
     if is_new_conv:
         conv.unread_count = max(int(chat.get("unread_count") or 0), 0)
     if last_any and (contact.last_contact_at is None or last_any > _aware(contact.last_contact_at)):
         contact.last_contact_at = last_any
-    return True
+    return added
 
 
-def sync_history(db: Session, number: WhatsAppNumber) -> int:
-    """Imports the most recent chats of one number. Returns how many chats were imported."""
-    acc = number.unipile_account_id
+def _list_chats(acc: str, wanted: int) -> list[dict]:
     chats, cursor = [], None
-    while len(chats) < MAX_CHATS:
+    while len(chats) < wanted:
         params = {"type": "1to1", "limit": CHAT_PAGE}
         if cursor:
             params["cursor"] = cursor
@@ -201,8 +273,14 @@ def sync_history(db: Session, number: WhatsAppNumber) -> int:
         cursor = body.get("next_cursor")
         if not cursor or not data:
             break
+    return chats[:wanted]
+
+
+def sync_history(db: Session, number: WhatsAppNumber) -> int:
+    """First import of one number: its most recent chats. Returns how many chats were imported."""
+    chats = _list_chats(number.unipile_account_id, MAX_CHATS)
     imported = failed = 0
-    for chat in chats[:MAX_CHATS]:
+    for chat in chats:
         try:
             if _import_chat(db, number, chat):
                 imported += 1
@@ -221,23 +299,94 @@ def sync_history(db: Session, number: WhatsAppNumber) -> int:
     return imported
 
 
-def sync_all() -> None:
-    if settings.WHATSAPP_MOCK or not settings.UNIPILE_API_KEY:
-        return
+def sync_recent(db: Session, number: WhatsAppNumber) -> int:
+    """Catch-up: re-reads only the chats whose last message is newer than what we have."""
+    known = {cid: last for cid, last in db.query(Conversation.provider_chat_id, Conversation.last_message_at).filter(
+        Conversation.whatsapp_number_id == number.id, Conversation.provider_chat_id.isnot(None))}
+    changed = 0
+    for chat in _list_chats(number.unipile_account_id, CHAT_PAGE):
+        ts = _ts(chat.get("last_message_timestamp") or (chat.get("last_message") or {}).get("timestamp"))
+        last = known.get(chat.get("id"))
+        if last is not None and (ts is None or ts <= _aware(last)):
+            continue  # known chat with nothing newer (or no date to compare): leave it to the webhook
+        try:
+            if _import_chat(db, number, chat):
+                changed += 1
+            db.commit()
+        except Exception:
+            db.rollback()
+            log.exception("Could not refresh chat %s of %s", chat.get("id"), number.phone)
+    return changed
+
+
+# ───────────────────────────── orchestration
+
+def _is_live() -> bool:
+    return not settings.WHATSAPP_MOCK and bool(settings.UNIPILE_API_KEY)
+
+
+def _accounts_step() -> dict:
+    """Account import. Never raises: the outcome is recorded in STATE."""
+    STATE["last_run_at"] = utcnow().isoformat()
     db = SessionLocal()
     try:
-        sync_accounts(db)
-        pending = db.query(WhatsAppNumber).filter(
-            WhatsAppNumber.unipile_account_id.isnot(None), WhatsAppNumber.history_synced_at.is_(None)
-        ).all()
-        for n in pending:
-            try:
-                sync_history(db, n)
-            except Exception:
-                db.rollback()
-                log.exception("History import failed for %s (will retry)", n.phone)
+        created = sync_accounts(db)
+        if STATE["accounts_found"] == 0:
+            STATE["error"] = ("Connected to the WhatsApp service, but it lists no WhatsApp accounts for this API key. Make sure the key belongs "
+                              "to the application that has your accounts, and is a Service Key (or set UNIPILE_ACCOUNT_IDS).")
+            return {"ok": False, "error": STATE["error"], "accounts_found": 0}
+        STATE.update(error=None, last_ok_at=utcnow().isoformat())
+        return {"ok": True, "created": len(created), "accounts_found": STATE["accounts_found"]}
+    except Exception as e:
+        db.rollback()
+        STATE["error"] = explain(e)
+        log.error("Account import failed: %s", STATE["error"])
+        return {"ok": False, "error": STATE["error"], "accounts_found": STATE["accounts_found"]}
     finally:
         db.close()
+
+
+def _chats_step() -> None:
+    """History for numbers not imported yet, catch-up for the others. One at a time."""
+    if not _work_lock.acquire(blocking=False):
+        return
+    STATE["history_importing"] = True
+    db = SessionLocal()
+    try:
+        for n in db.query(WhatsAppNumber).filter(WhatsAppNumber.unipile_account_id.isnot(None)).all():
+            try:
+                if n.history_synced_at is None:
+                    STATE["imported_chats"] += sync_history(db, n)
+                else:
+                    STATE["imported_chats"] += sync_recent(db, n)
+            except Exception as e:
+                db.rollback()
+                STATE["error"] = f"{n.phone}: {explain(e)}"
+                log.error("Chat sync failed for %s: %s", n.phone, STATE["error"])
+    finally:
+        db.close()
+        STATE["history_importing"] = False
+        _work_lock.release()
+
+
+def sync_all() -> dict | None:
+    if not _is_live():
+        return None
+    report = _accounts_step()
+    if report["ok"]:
+        _chats_step()
+    return report
+
+
+def refresh_now() -> dict:
+    """Super Admin 'Refresh': accounts right now (so the answer is real), chats in the background."""
+    if not _is_live():
+        return {"ok": False, "error": "WhatsApp is not live: set UNIPILE_API_KEY (and WHATSAPP_MOCK must not be true)."}
+    report = _accounts_step()
+    if report["ok"] and not _work_lock.locked():
+        threading.Thread(target=_chats_step, daemon=True, name="chat-sync-now").start()
+    report["history_importing"] = True
+    return report
 
 
 _started = False
@@ -254,7 +403,7 @@ def start_sync_loop() -> None:
             try:
                 sync_all()
             except Exception:
-                log.exception("Account sync failed (will retry)")
+                log.exception("Sync cycle failed (will retry)")
             time.sleep(SYNC_SECONDS)
 
     threading.Thread(target=loop, daemon=True, name="account-sync").start()

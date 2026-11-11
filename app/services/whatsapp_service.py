@@ -47,6 +47,11 @@ class WhatsAppServiceInterface(ABC):
         """Image / video / voice note / sticker / document — WhatsApp decides by the file's type."""
 
     @abstractmethod
+    def send_attachment(self, from_number: str, to: str, data: bytes, content_type: str, filename: str,
+                        caption: str | None = None, voice_note: bool = False, duration: int | None = None) -> SendResult:
+        """A file picked or recorded in the inbox: photo, video, document or voice note."""
+
+    @abstractmethod
     def send_template(self, from_number: str, to: str, template_id: str, variables: dict | None = None) -> SendResult:
         """Pre-approved template — the only way to message someone outside the 24h window."""
 
@@ -63,6 +68,9 @@ class MockWhatsAppService(WhatsAppServiceInterface):
         return self._mock()
 
     def send_media(self, from_number, to, media_url, caption=None):
+        return self._mock()
+
+    def send_attachment(self, from_number, to, data, content_type, filename, caption=None, voice_note=False, duration=None):
         return self._mock()
 
     def send_template(self, from_number, to, template_id, variables=None):
@@ -188,6 +196,16 @@ class UnipileWhatsAppService(WhatsAppServiceInterface):
         filename = urlparse(media_url).path.rsplit("/", 1)[-1] or "file"
         content_type = (dl.headers.get("content-type") or "").split(";")[0] or mimetypes.guess_type(filename)[0] or "application/octet-stream"
         attachment = {"content": base64.b64encode(dl.content).decode(), "content_type": content_type, "filename": filename}
+        return self._send(from_number, to, caption or "", [attachment])
+
+    def send_attachment(self, from_number, to, data, content_type, filename, caption=None, voice_note=False, duration=None):
+        import base64
+
+        attachment = {"content": base64.b64encode(data).decode(), "content_type": content_type, "filename": filename}
+        if voice_note:
+            attachment["voice_note"] = True  # plays as a voice message
+        if duration:
+            attachment["metadata"] = {"duration": int(duration)}
         return self._send(from_number, to, caption or "", [attachment])
 
     def send_template(self, from_number, to, template_id, variables=None):

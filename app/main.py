@@ -13,7 +13,7 @@ from app.bootstrap import ensure_bootstrap_admin, warn_default_passwords
 from app.services.automation_runner import start_poller
 from app.services.campaign_runner import resume_interrupted_campaigns
 from app.services.sync import start_sync_loop
-from app.services.demo_cleanup import purge_if_requested
+from app.services.demo_cleanup import cleanup_demo_data_on_start
 from app.api.v1.api import api_router
 
 app = FastAPI(title=settings.PROJECT_NAME)
@@ -42,7 +42,7 @@ def on_startup():
     Base.metadata.create_all(bind=engine)
     upgrade_schema(engine)  # adds new columns to existing tables (dev convenience)
     ensure_bootstrap_admin()
-    purge_if_requested()  # one-time, only when PURGE_DEMO_DATA=true
+    cleanup_demo_data_on_start()  # removes the demo seed; real numbers and chats are never touched
     if not settings.WHATSAPP_MOCK and not settings.UNIPILE_API_KEY:
         logging.getLogger("relay").error("WhatsApp is live but UNIPILE_API_KEY is not set — nothing can be sent or imported")
     threading.Thread(target=warn_default_passwords, daemon=True).start()  # bcrypt checks: keep startup fast

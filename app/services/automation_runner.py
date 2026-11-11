@@ -10,8 +10,7 @@ poller thread (start_poller, called on startup) executes due runs, so waits
 How the flow's nodes (a linear list, as saved by the builder) are executed:
   trigger    skipped
   action     "…human/transfer/assign…" in the label -> hand the chat to a human;
-             otherwise sends one of node.messageVariants (random, {{name}} works).
-             An action with no message text is skipped and noted in the thread.
+             otherwise sends one of node.messageVariants (or the built-in text for the label) (rotating, or random if the step says so; {{name}} works).
   delay      pauses the run: node.delay_minutes, else parsed from the label
              ("Wait 2 hours", "30 min", "1 day"), else 60 minutes.
   condition  "Customer replied?": true if the customer wrote after the trigger.
@@ -29,6 +28,7 @@ from datetime import datetime, timedelta, timezone
 
 from sqlalchemy.orm import Session
 
+from app.core.automation_templates import DEFAULT_FLOW, default_message_for
 from app.db.session import SessionLocal
 from app.models.automation import Automation, AutomationRun, AutomationStatus
 from app.models.contact import Contact
@@ -93,13 +93,14 @@ def _do_action(db: Session, automation: Automation, run: AutomationRun, node: di
         _handoff(db, automation, conv)
         return
     variants = [v for v in (node.get("messageVariants") or []) if isinstance(v, str) and v.strip()]
-    if not variants:
-        db.add(Message(conversation_id=conv.id, sender=MessageSender.SYSTEM, type=MessageType.NOTE,
-                       text=f"Automation \"{automation.name}\": step \"{node.get('label')}\" has no message text — skipped",
-                       status=MessageStatus.SENT))
-        return
+    if not variants:  # no text written for this step: use the built-in wording for its label
+        variants = [default_message_for(node.get("label"))]
+    if node.get("assignmentMode") == "random":
+        text = random.choice(variants)
+    else:  # round-robin (the builder's default): rotate through the variants
+        text = variants[(automation.sent or 0) % len(variants)]
     msg = send_message(db, get_whatsapp_service(), number=number, contact=contact, conversation=conv,
-                       text=_personalize(random.choice(variants), contact))
+                       text=_personalize(text, contact))
     if msg.provider_message_id:
         automation.sent = (automation.sent or 0) + 1
 
@@ -113,7 +114,7 @@ def _advance(db: Session, run: AutomationRun) -> None:
         run.status = "done"  # paused/deleted automation or opted-out contact: stop quietly
         return
 
-    nodes = (automation.flow or {}).get("nodes") or []
+    nodes = (automation.flow or {}).get("nodes") or DEFAULT_FLOW["nodes"]  # nothing saved: the built-in flow
     i = run.next_index
     while i < len(nodes):
         node = nodes[i] if isinstance(nodes[i], dict) else {}

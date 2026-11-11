@@ -8,7 +8,10 @@ from app.db.session import get_db
 from app.models.user import User
 from app.models.automation import Automation
 from app.models.activity_log import ActivityLog
-from app.schemas.automation import AutomationCreate, AutomationUpdate, AutomationOut
+from app.core.automation_templates import TEMPLATES, flow_of, get_template, steps_of
+from app.schemas.automation import (
+    AutomationCreate, AutomationUpdate, AutomationOut, AutomationFromTemplate, AutomationTemplateOut,
+)
 
 router = APIRouter(prefix="/automations", tags=["automations"])
 
@@ -19,6 +22,27 @@ def list_automations(db: Session = Depends(get_db), scope: uuid.UUID | None = De
     if scope:
         q = q.filter(Automation.admin_id == scope)
     return q.order_by(Automation.created_at.desc()).all()
+
+
+@router.get("/templates", response_model=list[AutomationTemplateOut])
+def list_templates(user: User = Depends(get_current_user)):
+    """Ready-made automations anyone can start from."""
+    return [AutomationTemplateOut(id=t["id"], name=t["name"], description=t["description"], steps=steps_of(t)) for t in TEMPLATES]
+
+
+@router.post("/from-template", response_model=AutomationOut)
+def create_from_template(payload: AutomationFromTemplate, db: Session = Depends(get_db), user: User = Depends(get_current_user), scope: uuid.UUID | None = Depends(admin_scope_filter)):
+    """Creates an automation from a template. It starts as Scheduled: review it, then activate it."""
+    template = get_template(payload.template_id)
+    if not template:
+        raise HTTPException(404, "Template not found")
+    name = (payload.name or "").strip() or template["name"]
+    automation = Automation(name=name[:160], trigger_type="new_customer", flow=flow_of(template), admin_id=scope or user.id)
+    db.add(automation)
+    db.add(ActivityLog(actor_id=user.id, type="automation", message=f"{user.name} created automation \"{automation.name}\" from the \"{template['name']}\" template"))
+    db.commit()
+    db.refresh(automation)
+    return automation
 
 
 @router.post("", response_model=AutomationOut)

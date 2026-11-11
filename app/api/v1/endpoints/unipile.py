@@ -16,6 +16,7 @@ import hashlib
 import hmac
 import logging
 import time
+import uuid
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
@@ -29,7 +30,7 @@ from app.models.contact import Contact, ContactStatus
 from app.models.conversation import ConversationStatus, Message, MessageSender, MessageStatus, MessageType
 from app.models.whatsapp_number import NumberStatus, WhatsAppNumber
 from app.services.automation_runner import start_new_customer_automations
-from app.services.chat_utils import digits_to_phone, find_contact, message_type, phone_from_user_id
+from app.services.chat_utils import attachment_fields, digits_to_phone, find_contact, phone_from_user_id
 from app.services.messaging import get_or_create_conversation, utcnow
 
 log = logging.getLogger("relay.unipile")
@@ -137,12 +138,11 @@ def _handle_message_new(db: Session, number: WhatsAppNumber, m: dict) -> None:
     attachments = m.get("attachments") or []
     first = attachments[0] if attachments else None
     body = m.get("text") or None
-    mtype = MessageType.TEXT
-    if first:
-        mtype = MessageType.STICKER if (first.get("type") == "img" and first.get("sticker")) else message_type(first.get("mimetype"))
+    mid_local = uuid.uuid4()
+    fields = {"type": MessageType.TEXT, **attachment_fields(first, mid_local)}
     db.add(Message(
-        conversation_id=conv.id, sender=MessageSender.CUSTOMER, type=mtype, text=body,
-        media_url=(first or {}).get("url"), status=MessageStatus.DELIVERED, provider_message_id=mid,
+        id=mid_local, conversation_id=conv.id, sender=MessageSender.CUSTOMER, text=body,
+        status=MessageStatus.DELIVERED, provider_message_id=mid, **fields,
     ))
 
     keyword = (body or "").strip().upper()

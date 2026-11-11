@@ -60,6 +60,7 @@ def main(default_port: int = 8000):
     os.environ["DATABASE_URL"] = "sqlite:///./dev.db"
     os.environ.setdefault("SECRET_KEY", "dev-secret-not-for-production")
     os.environ.setdefault("WHATSAPP_MOCK", "true")  # demo data + fake sends: local only
+    os.environ.setdefault("KEEP_DEMO_DATA", "true")  # a developer machine keeps its demo data
     if args.reset and os.path.exists("dev.db"):
         os.remove("dev.db")
 

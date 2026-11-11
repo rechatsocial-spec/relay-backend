@@ -147,25 +147,54 @@ their chats are imported. Every figure in the app is counted from the real messa
 delivery rate / reply rate, and the Admin performance table. Numbers' connection status is asked
 from the WhatsApp service every 10 s; the inbox refreshes every 5 s and new messages arrive by webhook.
 
-The demo seed (`python -m app.seed`, accounts `*@relaycrm.io` with the password `password123`) is for
-local development only (`run_dev_sqlite.py` turns mock mode on for it). To remove it from a deployed
-database: set `BOOTSTRAP_ADMIN_EMAIL` / `BOOTSTRAP_ADMIN_PASSWORD` (a real Super Admin must exist),
-then either deploy once with `PURGE_DEMO_DATA=true` (and remove it afterwards) or run
-`python -m app.purge_demo` (dry run) and `python -m app.purge_demo --yes`. It deletes the demo users,
-the fake numbers and everything attached to them; connected numbers and their chats are kept and
-handed to the real Super Admin. `PURGE_KEEP_EMAILS` lists demo-domain accounts to keep.
+The demo seed (`python -m app.seed`, accounts `*@relaycrm.io` with the password `password123`) is removed
+automatically at every startup (`app/services/demo_cleanup.py`; developer machines set `KEEP_DEMO_DATA=true`).
+Two steps, so you can't be locked out: the **data** (fake numbers and everything attached, seeded automations,
+keys, logs) is always removed; the **demo logins** are removed only once a real Super Admin exists
+(`BOOTSTRAP_ADMIN_EMAIL` / `BOOTSTRAP_ADMIN_PASSWORD`) and whatever they owned moves to that account.
+Connected numbers and their chats are never touched. Preview with `python -m app.purge_demo`,
+apply by hand with `--yes`. `PURGE_KEEP_EMAILS` lists demo-domain accounts to keep.
+
+A configured `UNIPILE_API_KEY` always means live mode, even if `WHATSAPP_MOCK=true` is still set.
+If your numbers don't appear: Super Admin → WhatsApp Numbers → **Refresh** shows the exact error
+(wrong key, key not allowed to list accounts → use a Service Key or `UNIPILE_ACCOUNT_IDS`, ...).
+
+### Attachments and voice notes
+
+The inbox composer sends real files: the paperclip / image / video buttons open the device's file picker
+(`POST /inbox/conversations/{id}/attachments`, multipart: `file`, optional `caption`, `voice`, `duration`),
+and the microphone button records in the browser. The file is sent through the WhatsApp service as a
+base64 attachment (one per message; the caption is sent with it) and kept in the database (`media_files`)
+so the thread can show it. Limit: `MAX_UPLOAD_MB` (default 16).
+
+Voice notes: browsers record WebM/Opus; WhatsApp wants Ogg/Opus, so the server converts them with ffmpeg
+(`imageio-ffmpeg` brings a static build; a system `ffmpeg` is used first if present) and sends the result as a
+playable voice message with its length. If no converter works, the recording is still sent as a voice note,
+unconverted.
+
+Received photos, videos, voice notes and documents are stored as references and shown through the app
+(`/media/m/{message}`), which fetches them from the service and adds the API key itself, only for the
+service's own address. Links are signed, so `<img>` / `<audio>` work without a login header.
 
 ### Automations on incoming chats
 
-When a `message.new` comes from someone who is not yet a contact, every **Running**
-automation of that number's admin with trigger `new_customer` starts a run
-(`app/services/automation_runner.py`). A poller thread (every 5 s) executes the flow
-nodes in order: send a `messageVariants` text (`{{name}}` works), wait (`delay_minutes`
-or parsed from "Wait 2 hours"), then the "Customer replied?" condition runs the nodes tagged
-`YES` or `NO`. An action whose label contains "human"/"transfer"/"assign" hands the chat to
-a human. Runs are stored in `automation_runs`, so waits survive restarts; pausing the
-automation stops waiting runs; opted-out contacts are never messaged. Chatbots (keyword
-menus) are not wired to incoming messages yet.
+When a `message.new` comes from someone who is not yet a contact, every **Running** automation of that
+number's admin with trigger `new_customer` starts a run (`app/services/automation_runner.py`). A poller
+thread (every 5 s) executes the flow steps in order: send a message (`messageVariants`, rotating or random
+per the step's strategy; `{{name}}` = first name), wait (`delay_minutes` or parsed from "Wait 2 hours"),
+then the "Customer replied?" condition runs the steps tagged `YES` or `NO`. A step whose label contains
+"human"/"transfer"/"assign" hands the chat to a human. Runs are stored in `automation_runs`, so waits
+survive restarts; pausing the automation stops waiting runs; opted-out contacts are never messaged.
+
+**Built-in flow.** An automation with no saved steps, and any message step with no text, uses the built-in
+flow the builder shows (new customer -> welcome -> wait 2 hours -> replied? -> YES transfer to human /
+NO follow-up) with built-in wording (`app/core/automation_templates.py`), so it works with zero setup.
+
+**Templates.** `GET /automations/templates` lists ready-made automations (Welcome new customers,
+Welcome + follow-up, Hand over to a human, Qualify new leads); `POST /automations/from-template` creates
+one (as *Scheduled*, ready to review and activate) for the signed-in Admin or Super Admin. The Automations
+page has a **New automation** button with the gallery. Chatbots (keyword menus) are not wired to incoming
+messages yet.
 
 ## Deploying on Render
 

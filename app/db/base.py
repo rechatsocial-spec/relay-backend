@@ -16,3 +16,4 @@ from app.models.automation import Automation, AutomationRun  # noqa: E402,F401
 from app.models.chatbot import Chatbot  # noqa: E402,F401
 from app.models.api_key import ApiKey  # noqa: E402,F401
 from app.models.activity_log import ActivityLog  # noqa: E402,F401
+from app.models.media import MediaFile  # noqa: E402,F401

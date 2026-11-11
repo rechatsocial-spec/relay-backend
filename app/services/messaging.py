@@ -90,3 +90,32 @@ def send_message(
     if result.success:
         number.messages_today = (number.messages_today or 0) + 1
     return message
+
+
+def send_attachment_message(
+    db: Session, whatsapp: WhatsAppServiceInterface, *, number: WhatsAppNumber, contact: Contact, conversation: Conversation,
+    data: bytes, content_type: str, filename: str, caption: str | None, voice_note: bool, duration: int | None, media_url: str,
+) -> Message:
+    """Sends a file through the provider and records it. Does not commit."""
+    result = whatsapp.send_attachment(number.phone, contact.phone, data, content_type, filename,
+                                      caption=caption or None, voice_note=voice_note, duration=duration)
+    if content_type.startswith("image/"):
+        mtype = MessageType.IMAGE
+    elif content_type.startswith("video/"):
+        mtype = MessageType.VIDEO
+    elif content_type.startswith("audio/"):
+        mtype = MessageType.VOICE
+    else:
+        mtype = MessageType.DOCUMENT
+    message = Message(
+        conversation_id=conversation.id, sender=MessageSender.BUSINESS, type=mtype, text=caption or None, media_url=media_url,
+        media_name=filename[:255], media_type=content_type[:120], duration_seconds=duration if voice_note else None,
+        status=MessageStatus.SENT if result.success else MessageStatus.FAILED,
+        provider_message_id=result.provider_message_id, error_code=result.error_code, error_message=result.error,
+    )
+    db.add(message)
+    now = utcnow()
+    conversation.last_message_at = now
+    contact.last_contact_at = now
+    number.last_activity_at = now
+    return message

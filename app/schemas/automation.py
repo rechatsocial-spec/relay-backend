@@ -33,3 +33,15 @@ class AutomationOut(BaseModel):
 
     class Config:
         from_attributes = True
+
+
+class AutomationTemplateOut(BaseModel):
+    id: str
+    name: str
+    description: str
+    steps: list[str]
+
+
+class AutomationFromTemplate(BaseModel):
+    template_id: str
+    name: str | None = None

@@ -34,7 +34,6 @@ services:
         sync: false
       - key: CORS_ORIGINS             # JSON list, e.g. ["https://app.yourdomain.com"]
         sync: false
-      # One-time demo-data cleanup: add PURGE_DEMO_DATA=true, deploy once, then delete it (see README).
       - key: BOOTSTRAP_ADMIN_EMAIL
         sync: false
       - key: BOOTSTRAP_ADMIN_PASSWORD

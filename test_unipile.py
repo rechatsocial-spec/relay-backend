@@ -93,10 +93,17 @@ MESSAGES = {  # newest first, like the real API
 USERS = {"555777@lid": "+91 98111 00099"}
 
 
+PROVIDER = {"all_fail": None, "list_fail": None}
+
+
 def provider_get(url, params=None, **kw):
     path = url.split("/v2", 1)[1]
     req = httpx.Request("GET", url)
     R = lambda code, data: httpx.Response(code, json=data, request=req)
+    if PROVIDER["all_fail"]:
+        return R(PROVIDER["all_fail"], {"detail": "nope"})
+    if path == "/accounts" and PROVIDER["list_fail"]:
+        return R(PROVIDER["list_fail"], {"detail": "not allowed"})
     if path == "/accounts":
         return R(200, {"object": "Accounts", "data": ACCOUNTS, "has_more": False})
     if (m := re.fullmatch(r"/(acc_\w+)/chats/(.+)/messages", path)):
@@ -155,6 +162,7 @@ check(all(client.request(m, f"/api/v1/whatsapp/{x}", headers=SA, json={}).status
           for m, x in (("POST", "link"), ("POST", "accounts"), ("GET", "callback"))), "Link / register / callback endpoints are gone")
 
 import app.services.sync as sync  # noqa: E402
+from app.core.config import settings  # noqa: E402
 sync.PAUSE_SECONDS = 0
 from app.models.whatsapp_number import WhatsAppNumber  # noqa: E402
 before = len(client.get("/api/v1/numbers", headers=SA).json())
@@ -503,6 +511,264 @@ fast_forward()
 ar.process_due_runs()
 check(len(fake.calls) == n4, "Pausing the automation stops runs that are waiting")
 
+# --- ready-made automation templates ---------------------------------------------
+tl = client.get("/api/v1/automations/templates", headers=ADMIN).json()
+check(client.get("/api/v1/automations/templates").status_code == 401, "The template gallery needs a sign-in")
+check({t["id"] for t in tl} == {"welcome", "welcome_followup", "handoff", "qualify"} and all(t["steps"] and t["description"] for t in tl), "An Admin gets the template gallery")
+check(client.post("/api/v1/automations/from-template", headers=ADMIN, json={"template_id": "nope"}).status_code == 404, "An unknown template is rejected")
+_make = lambda tid, h=ADMIN, **kw: client.post("/api/v1/automations/from-template", headers=h, json={"template_id": tid, **kw})
+r = _make("welcome", name="My welcome")
+check(r.status_code == 200 and r.json()["name"] == "My welcome" and r.json()["status"] == "Scheduled" and r.json()["admin_id"] == rahul_id and r.json()["trigger_type"] == "new_customer",
+      "Creating from a template makes a Scheduled automation owned by the Admin")
+check(_make("welcome").json()["name"] == "Welcome new customers" and "My welcome" in [a["name"] for a in client.get("/api/v1/automations", headers=ADMIN).json()], "Default name is the template's; it shows in the Admin's list")
+check(_make("handoff", h=SA).status_code == 200, "A Super Admin can use templates too")
+check("from the" in json.dumps(client.get("/api/v1/activity-logs", headers=SA).json()), "Creating from a template is logged")
+
+def only_running(aid):
+    with SessionLocal() as db:
+        for a in db.query(Automation).all():
+            a.status = AutomationStatus.PAUSED
+        db.query(AutomationRun).delete()
+        if aid:
+            db.get(Automation, uuid.UUID(aid)).status = AutomationStatus.RUNNING
+        db.commit()
+_n = iter(range(100, 999))
+def new_customer(text="hello"):
+    sender = f"91985{next(_n):07d}@s.whatsapp.net"
+    inbound("tpl_" + sender[:12], text, sender)
+    ar.process_due_runs()
+    return sender
+def notes(sender):
+    with SessionLocal() as db:
+        conv = db.query(Conversation).filter(Conversation.provider_chat_id == sender).first()
+        return [m.text for m in db.query(Message).filter(Message.conversation_id == conv.id).all() if m.type.value == "note"]
+
+# welcome
+only_running(_make("welcome").json()["id"]); n0 = len(fake.calls); c = new_customer()
+check(len(fake.calls) == n0 + 1 and fake.calls[-1]["json"]["text"] == "Hi Asha! Thanks for contacting us. How can we help you today?", "Template 'Welcome': greets a new customer, name filled in")
+# welcome + follow-up: silent customer
+only_running(_make("welcome_followup").json()["id"]); n0 = len(fake.calls); silent = new_customer()
+check(len(fake.calls) == n0 + 1 and "How can we help" in fake.calls[-1]["json"]["text"], "Template 'Welcome + follow-up': welcome goes out first")
+fast_forward(); ar.process_due_runs()
+check(len(fake.calls) == n0 + 2 and "just checking in" in fake.calls[-1]["json"]["text"], "...a silent customer gets the follow-up after the wait")
+# welcome + follow-up: customer replies
+only_running(_make("welcome_followup").json()["id"]); talker = new_customer()
+inbound("tpl_reply", "yes please", talker)
+n0 = len(fake.calls); fast_forward(); ar.process_due_runs()
+check(len(fake.calls) == n0 and any("handed this chat to a human" in (t or "") for t in notes(talker)), "...a customer who replied is handed to a human, no follow-up")
+# hand over
+only_running(_make("handoff").json()["id"]); n0 = len(fake.calls); h = new_customer()
+check(len(fake.calls) == n0 + 1 and fake.calls[-1]["json"]["text"].startswith("Thanks Asha, a member of our team") and any("handed this chat to a human" in (t or "") for t in notes(h)),
+      "Template 'Hand over to a human': acknowledges, then flags the chat")
+# qualify
+only_running(_make("qualify").json()["id"]); n0 = len(fake.calls); q = new_customer()
+check(len(fake.calls) == n0 + 1 and "budget" in fake.calls[-1]["json"]["text"], "Template 'Qualify new leads': asks what they need")
+fast_forward(); ar.process_due_runs()
+check(len(fake.calls) == n0 + 2 and "whenever you are ready" in fake.calls[-1]["json"]["text"], "...and reminds a silent lead after a day")
+# message variants: rotation and random
+two = {"nodes": [{"id": "trigger", "type": "trigger", "label": "New customer"},
+                 {"id": "w", "type": "action", "label": "Send message", "messageVariants": ["Variant A for {{name}}", "Variant B for {{name}}"], "assignmentMode": "round_robin"}]}
+aid = client.post("/api/v1/automations", headers=ADMIN, json={"name": "Two variants", "flow": two}).json()["id"]
+only_running(aid); first = (new_customer(), fake.calls[-1]["json"]["text"])[1]; second = (new_customer(), fake.calls[-1]["json"]["text"])[1]
+check([first, second] == ["Variant A for Asha", "Variant B for Asha"], "Round-robin rotates through the message variants")
+two["nodes"][1]["assignmentMode"] = "random"
+client.patch(f"/api/v1/automations/{aid}", headers=ADMIN, json={"flow": two}); only_running(aid)
+seen = {(new_customer(), fake.calls[-1]["json"]["text"])[1] for _ in range(12)}
+check(seen <= {"Variant A for Asha", "Variant B for Asha"} and len(seen) == 2, "Random picks among the variants")
+only_running(None)
+
+# --- the built-in (hard-coded) flow runs without anyone writing a message -----------
+builder_default = {"nodes": [  # exactly what the builder shows for a new automation
+    {"id": "trigger", "type": "trigger", "label": "New customer", "sub": "Trigger", "icon": "Zap"},
+    {"id": "welcome", "type": "action", "label": "Send welcome message", "sub": "Text + image", "icon": "Send"},
+    {"id": "delay", "type": "delay", "label": "Wait 2 hours", "sub": "Delay", "icon": "Clock"},
+    {"id": "condition", "type": "condition", "label": "Customer replied?", "sub": "Condition", "icon": "GitBranch"},
+    {"id": "yes", "type": "action", "label": "Transfer to human", "sub": "YES", "icon": "UserCog"},
+    {"id": "no", "type": "action", "label": "Send follow-up", "sub": "NO", "icon": "Send"},
+]}
+aid = client.post("/api/v1/automations", headers=ADMIN, json={"name": "Builder default", "flow": builder_default}).json()["id"]
+only_running(aid); n0 = len(fake.calls); c1 = new_customer()
+check(len(fake.calls) == n0 + 1 and fake.calls[-1]["json"]["text"] == "Hi Asha! Thanks for contacting us. How can we help you today?", "The builder's default flow: welcome goes out with built-in wording")
+fast_forward(); ar.process_due_runs()
+check(len(fake.calls) == n0 + 2 and "just checking in" in fake.calls[-1]["json"]["text"], "...then, after 2 hours of silence, the follow-up")
+only_running(aid); c2 = new_customer(); inbound("dflt_reply", "hi again", c2); n0 = len(fake.calls); fast_forward(); ar.process_due_runs()
+check(len(fake.calls) == n0 and any("handed this chat to a human" in (t or "") for t in notes(c2)), "...and a customer who answered is transferred to a human")
+# an automation that has no saved steps at all runs the same flow
+blank = client.post("/api/v1/automations", headers=ADMIN, json={"name": "Nothing saved yet"}).json()
+only_running(blank["id"]); n0 = len(fake.calls); new_customer()
+check(blank["flow"] == {} and len(fake.calls) == n0 + 1 and "Thanks for contacting us" in fake.calls[-1]["json"]["text"], "An automation with no saved steps runs the built-in flow")
+# older shape (the demo data): trigger + one welcome step without any text
+old = client.post("/api/v1/automations", headers=ADMIN, json={"name": "Old shape", "flow": {"nodes": [
+    {"type": "trigger", "label": "New customer"}, {"type": "action", "label": "Send welcome message"}]}}).json()
+only_running(old["id"]); n0 = len(fake.calls); new_customer()
+check(len(fake.calls) == n0 + 1 and "Thanks for contacting us" in fake.calls[-1]["json"]["text"], "A welcome step with no text still sends the built-in welcome")
+only_running(None)
+
+# --- importer: real phone, visible errors, fallback ids, catch-up ------------------------
+from app.core.config import Settings  # noqa: E402
+check(Settings(_env_file=None, WHATSAPP_MOCK=True, UNIPILE_API_KEY="k").WHATSAPP_MOCK is False and Settings(_env_file=None, WHATSAPP_MOCK=True, UNIPILE_API_KEY="").WHATSAPP_MOCK is True,
+      "A configured API key always means live mode, even if WHATSAPP_MOCK=true is still set")
+ACCOUNTS.append({"id": "acc_789", "name": "Shop Line", "user_id": "919800000789@s.whatsapp.net", "status": "running", "provider": "whatsapp"})
+with SessionLocal() as db:
+    created = sync.sync_accounts(db)
+shop = next(n for n in client.get("/api/v1/numbers", headers=SA).json() if n["display_name"] == "Shop Line")
+check(len(created) == 1 and shop["phone"] == "+919800000789", "The number's phone comes from the account's own id, the name stays as the label")
+
+ACCOUNTS[0]["application_id"] = "app_01test"
+_saved = list(ACCOUNTS); ACCOUNTS.clear()
+rep = sync.refresh_now()
+check(rep["ok"] is False and "no WhatsApp accounts" in rep["error"] and "application" in rep["error"], "A key that sees zero accounts is explained (wrong application?)")
+ACCOUNTS.extend(_saved)
+check(sync.refresh_now()["ok"] is True and sync.STATE["application_id"] == "app_01test", "The application the key belongs to is reported (compare it with your dashboard)")
+for _ in range(60):
+    if not sync.STATE["history_importing"]:
+        break
+    __import__("time").sleep(0.1)
+PROVIDER["all_fail"] = 401
+rep = sync.refresh_now()
+check(rep["ok"] is False and "401" in rep["error"] and "API key" in rep["error"], "A rejected key is reported in plain words")
+check("401" in client.get("/api/v1/system/whatsapp", headers=SA).json()["sync"]["error"] and client.get("/api/v1/system/whatsapp", headers=ADMIN).json()["sync"]["error"] is None,
+      "The Super Admin sees the sync error in the status; Admins don't")
+PROVIDER["all_fail"] = None
+PROVIDER["list_fail"] = 403
+rep = sync.refresh_now()
+check(rep["ok"] is False and "403" in rep["error"] and "UNIPILE_ACCOUNT_IDS" in rep["error"], "A key that cannot list accounts says what to do")
+settings.UNIPILE_ACCOUNT_IDS = "acc_123, acc_456, acc_789"
+rep = sync.refresh_now()
+check(rep["ok"] is True and rep["accounts_found"] == 3, "...and listing the account ids by hand is enough")
+settings.UNIPILE_ACCOUNT_IDS = ""
+PROVIDER["list_fail"] = None
+rep = sync.refresh_now()
+check(rep["ok"] is True and rep["accounts_found"] == 3 and sync.STATE["error"] is None, "Once fixed, a refresh succeeds and clears the error")
+import time as _t  # noqa: E402
+for _ in range(60):
+    if not sync.STATE["history_importing"]:
+        break
+    _t.sleep(0.1)
+
+# catch-up: a new customer message + a message we sent from this app (stored under another id)
+sent = client.post(f"/api/v1/inbox/conversations/{byphone['+919811111111']['id']}/messages", headers=SA, json={"type": "text", "text": "Thanks, noted!"}).json()
+from datetime import timedelta as _td2  # noqa: E402
+now_iso = (_dt.now(_tz.utc) + _td2(seconds=30)).strftime("%Y-%m-%dT%H:%M:%S.000Z")  # after the reply we just sent
+MESSAGES["919811111111@s.whatsapp.net"].insert(0, _m("w5", "One more question", now_iso))
+MESSAGES["919811111111@s.whatsapp.net"].insert(0, _m("provider_id_for_sent", "Thanks, noted!", now_iso, True))
+CHATS["acc_123"][0]["last_message_timestamp"] = now_iso
+with SessionLocal() as db:
+    nm = db.query(WhatsAppNumber).filter(WhatsAppNumber.unipile_account_id == "acc_123").first()
+    before_msgs = db.query(Message).count()
+    changed = sync.sync_recent(db, nm)
+    texts = [m.text for m in db.query(Message).join(Conversation, Conversation.id == Message.conversation_id).filter(Conversation.provider_chat_id == "919811111111@s.whatsapp.net").all()]
+    adopted = db.query(Message).filter(Message.provider_message_id == "provider_id_for_sent").count()
+    check(changed >= 1 and "One more question" in texts, "Catch-up sync picks up a customer message that no webhook delivered")
+    check(texts.count("Thanks, noted!") == 1 and adopted == 1, "A message sent from this app is not shown twice: it adopts the service's id")
+    check(db.query(Message).count() == before_msgs + 1, "Only the genuinely new message was added")
+    check(sync.sync_recent(db, nm) == 0, "Nothing new: the next catch-up reads nothing")
+    conv_row = db.query(Conversation).filter(Conversation.provider_chat_id == "919811111111@s.whatsapp.net").first()
+    check(conv_row.unread_count >= 1, "The new message counts as unread")
+
+# --- attachments and voice notes ---------------------------------------------------
+import base64 as _b64  # noqa: E402
+import subprocess as _sp  # noqa: E402
+import app.api.v1.endpoints.inbox as _inbox  # noqa: E402
+from app.services.media import sign as _sign  # noqa: E402
+from app.services.audio import ffmpeg_path as _ffmpeg  # noqa: E402
+att_conv = byphone["+919811111111"]["id"]
+PNG = b"\x89PNG\r\n\x1a\n" + bytes(range(200))
+def upload(name, data, ctype, h=SA, cid=None, **form):
+    return client.post(f"/api/v1/inbox/conversations/{cid or att_conv}/attachments", headers=h, files={"file": (name, data, ctype)}, data=form)
+
+r = upload("photo.png", PNG, "image/png", caption="Look at this")
+sent_body = fake.calls[-1]["json"]; att = sent_body["attachments"][0]; img = r.json()
+check(r.status_code == 200 and fake.calls[-1]["url"].endswith("/chats/919811111111@s.whatsapp.net/messages/send"), "A photo goes out through the chat's own send route")
+check(sent_body["text"] == "Look at this" and _b64.b64decode(att["content"]) == PNG and att["content_type"] == "image/png" and att["filename"] == "photo.png" and "voice_note" not in att,
+      "...as a base64 attachment with its caption, type and file name")
+check(img["type"] == "image" and img["text"] == "Look at this" and img["media_name"] == "photo.png" and img["media_type"] == "image/png" and img["status"] == "sent" and img["media_url"].startswith("/api/v1/media/"),
+      "The sent photo is stored on the chat with its file details")
+got = client.get(img["media_url"])
+check(got.status_code == 200 and got.content == PNG and got.headers["content-type"] == "image/png", "The thread can show it: the signed link serves the exact bytes, no login needed")
+check(client.get(img["media_url"].replace("t=", "t=0")).status_code == 403, "A tampered link is refused")
+bare = img["media_url"].split("?")[0]
+check(client.get(bare).status_code == 403, "A link without its signature is refused")
+_u = uuid.uuid4()
+check(client.get(f"/api/v1/media/{_u}?t={_sign(str(_u))}").status_code == 404, "A correctly signed link to nothing is a 404")
+
+r = upload("price list.pdf", b"%PDF-1.4 fake", "application/pdf")
+check(r.json()["type"] == "document" and r.json()["media_name"] == "price list.pdf" and fake.calls[-1]["json"]["attachments"][0]["content_type"] == "application/pdf", "A PDF is sent and shown as a document")
+r = upload("clip.mp4", b"\x00\x00\x00\x18ftypmp42", "video/mp4")
+check(r.json()["type"] == "video" and fake.calls[-1]["json"]["text"] == "", "A video is sent (no caption)")
+
+# voice note: browser audio -> Ogg/Opus voice message
+_real = _inbox.to_ogg_opus
+_inbox.to_ogg_opus = lambda d: b"OggS-converted"
+r = upload("voice.webm", b"webm-bytes", "audio/webm;codecs=opus", voice="true", duration="7")
+att = fake.calls[-1]["json"]["attachments"][0]
+check(_b64.b64decode(att["content"]) == b"OggS-converted" and att["content_type"] == "audio/ogg" and att["filename"] == "voice.ogg" and att["voice_note"] is True and att["metadata"] == {"duration": 7},
+      "Voice note: converted to Ogg/Opus and flagged as a playable voice message with its length")
+check(r.json()["type"] == "voice" and r.json()["duration_seconds"] == 7 and r.json()["media_type"] == "audio/ogg", "...and stored as a voice message on the chat")
+_inbox.to_ogg_opus = lambda d: None
+r = upload("voice.webm", b"webm-bytes", "audio/webm", voice="true", duration="3")
+att = fake.calls[-1]["json"]["attachments"][0]
+check(r.status_code == 200 and att["content_type"] == "audio/webm" and att["voice_note"] is True, "No converter available: the recording is still sent as a voice note, unconverted")
+_inbox.to_ogg_opus = _real
+if _ffmpeg():
+    import io as _io, math as _math, struct as _struct, wave as _wave
+    buf = _io.BytesIO()
+    with _wave.open(buf, "wb") as w:
+        w.setnchannels(1); w.setsampwidth(2); w.setframerate(44100)
+        w.writeframes(b"".join(_struct.pack("<h", int(9000 * _math.sin(2 * _math.pi * 440 * i / 44100))) for i in range(44100)))
+    webm = _sp.run([_ffmpeg(), "-loglevel", "error", "-i", "pipe:0", "-c:a", "libopus", "-f", "webm", "pipe:1"], input=buf.getvalue(), capture_output=True).stdout
+    r = upload("voice.webm", webm, "audio/webm;codecs=opus", voice="true", duration="1")
+    att = fake.calls[-1]["json"]["attachments"][0]; raw = _b64.b64decode(att["content"])
+    check(webm[:4] == b"\x1aE\xdf\xa3" and raw[:4] == b"OggS" and b"OpusHead" in raw and att["content_type"] == "audio/ogg", "Real conversion: a real WebM/Opus recording leaves as a real Ogg/Opus voice note")
+else:
+    print("[skip] no ffmpeg on this machine: real conversion not exercised")
+check(upload("notes.txt", b"just text", "text/plain", voice="true").status_code == 400, "A 'voice note' that is not audio is rejected")
+
+check(upload("empty.png", b"", "image/png").status_code == 400, "An empty file is rejected")
+_lim = settings.MAX_UPLOAD_MB; settings.MAX_UPLOAD_MB = 1
+check(upload("big.bin", b"x" * (1024 * 1024 + 5), "application/octet-stream").status_code == 413, "A file over the size limit is refused (413)")
+settings.MAX_UPLOAD_MB = _lim
+stop_conv = next(c["id"] for c in client.get("/api/v1/inbox/conversations", headers=SA).json() if c["contact"]["phone"] == "+919876500002")
+check(upload("photo.png", PNG, "image/png", cid=stop_conv).status_code == 400, "No attachments to a customer who replied STOP")
+check(upload("photo.png", PNG, "image/png", h=other_h).status_code == 404, "Another admin cannot send into this chat")
+fake.fail = True
+r = upload("photo.png", PNG, "image/png")
+check(r.status_code == 200 and r.json()["status"] == "failed" and "not on WhatsApp" in (r.json()["error_message"] or ""), "A provider failure is shown on the message, not hidden")
+fake.fail = False
+
+# received media: shown through a signed proxy that only sends the key to the service itself
+def inbound_media(mid, atts, text=""):
+    webhook({"type": "message.new", "account_id": "acc_123", "payload": {"id": mid, "chat_id": "919811111111@s.whatsapp.net", "sender_id": "919811111111@s.whatsapp.net",
+             "text": text, "is_sender": False, "attachments": atts}})
+    with SessionLocal() as db:
+        return db.query(Message).filter(Message.provider_message_id == mid).first()
+m_img = inbound_media("in_img", [{"type": "img", "mimetype": "image/jpeg", "url": "https://cdn.example.com/files/pic.jpg", "filename": "pic.jpg"}], "my photo")
+m_voice = inbound_media("in_voice", [{"type": "audio", "mimetype": "audio/ogg", "url": settings.UNIPILE_BASE_URL + "/files/voice1", "duration": 5000, "voice_note": True}])
+m_doc = inbound_media("in_doc", [{"type": "file", "mimetype": "application/pdf", "url": "https://cdn.example.com/files/menu.pdf", "filename": "menu.pdf"}])
+check(m_img.type.value == "image" and m_voice.type.value == "voice" and m_doc.type.value == "document" and m_voice.duration_seconds == 5 and m_doc.media_name == "menu.pdf",
+      "Received photo, voice note (5000 ms -> 5 s) and document are typed correctly")
+check(all(m.media_url.startswith("/api/v1/media/m/") and m.media_source for m in (m_img, m_voice, m_doc)), "...and shown through the app, not the raw service address")
+_seen = []
+_prev = httpx.get
+def _recorder(url, headers=None, **kw):
+    _seen.append((url, dict(headers or {})))
+    return httpx.Response(200, content=b"FILEBYTES", headers={"content-type": "application/octet-stream"}, request=httpx.Request("GET", url))
+httpx.get = _recorder
+g1 = client.get(m_img.media_url); g2 = client.get(m_voice.media_url)
+httpx.get = _prev
+check(g1.status_code == 200 and g1.content == b"FILEBYTES" and g1.headers["content-type"] == "image/jpeg", "A received photo is fetched and served with its type")
+check("X-API-KEY" not in _seen[0][1] and _seen[1][1].get("X-API-KEY") == "key_test", "The API key goes only to the service's own address, never to other hosts")
+check(client.get(m_img.media_url.replace("t=", "t=1")).status_code == 403, "Received-media links are signed too")
+chat_msgs = client.get(f"/api/v1/inbox/conversations/{att_conv}", headers=SA).json()["messages"]
+check({"image", "voice", "document", "video"} <= {m["type"] for m in chat_msgs}, "The chat thread lists every attachment type")
+# history import carries attachments too
+CHATS["acc_456"].append({"id": "919833333333@s.whatsapp.net", "name": "Media Fan", "user_id": "919833333333@s.whatsapp.net", "unread_count": 1})
+MESSAGES["919833333333@s.whatsapp.net"] = [_m("hist_1", "", "2026-11-10T12:00:00.000Z", False, attachments=[{"type": "img", "mimetype": "image/png", "url": "https://cdn.example.com/h.png", "filename": "h.png"}])]
+with SessionLocal() as db:
+    sync.sync_history(db, db.query(WhatsAppNumber).filter(WhatsAppNumber.unipile_account_id == "acc_456").first())
+    hm = db.query(Message).filter(Message.provider_message_id == "hist_1").first()
+    check(hm is not None and hm.type.value == "image" and hm.media_url.startswith("/api/v1/media/m/"), "Imported history keeps photos too")
+
 # --- demo-data cleanup ------------------------------------------------------------
 from app.services.demo_cleanup import purge_demo_data  # noqa: E402
 from app.models.user import User  # noqa: E402
@@ -515,16 +781,29 @@ with SessionLocal() as db:
     real_convs = db.query(Conversation).join(WhatsAppNumber, WhatsAppNumber.id == Conversation.whatsapp_number_id).filter(WhatsAppNumber.unipile_account_id.isnot(None)).count()
     real_msgs = db.query(Message).join(Conversation, Conversation.id == Message.conversation_id).join(WhatsAppNumber, WhatsAppNumber.id == Conversation.whatsapp_number_id).filter(WhatsAppNumber.unipile_account_id.isnot(None)).count()
     users_before, numbers_before = db.query(User).count(), db.query(WhatsAppNumber).count()
+    # a real-looking number someone added by hand AFTER the seed must survive (backdate the seed-like timestamps)
+    from datetime import timedelta as _td  # noqa: E402
+    manual = WhatsAppNumber(phone="+15550001111", display_name="Added by hand", admin_id=db.query(User).filter(User.email == "rahul.sharma@relaycrm.io").first().id)
+    db.add(manual); db.commit()
+    manual.created_at = _dt.now(_tz.utc) + _td(days=2); db.commit()
+    numbers_before += 1
     dry = purge_demo_data(db, dry_run=True)
-    check(dry["error"] is None and dry["new_owner"] == "boss@example.com" and dry["deleted"]["numbers"] == numbers_before - real_numbers and dry["deleted"]["users"] == 13,
-          "Dry run lists the demo data and who inherits the real numbers")
+    check(dry["error"] is None and dry["new_owner"] == "boss@example.com" and dry["deleted"]["numbers"] == numbers_before - real_numbers - 1 and dry["deleted"]["users"] == 13,
+          "Dry run lists the demo data (not the number added by hand) and who inherits the real numbers")
+    boss_row = db.query(User).filter(User.email == "boss@example.com").first()
+    boss_row.role = "admin" if isinstance(boss_row.role, str) else type(boss_row.role).ADMIN; db.commit()
+    nolog = purge_demo_data(db, dry_run=True)
+    check(nolog["new_owner"] is None and nolog["deleted"]["users"] == 0 and nolog["deleted"]["numbers"] == numbers_before - real_numbers - 1 and "demo logins" in nolog["warning"],
+          "Without a real Super Admin the demo data goes but the logins stay (no lock-out)")
+    boss_row.role = type(boss_row.role).SUPER_ADMIN; db.commit()
     check(db.query(User).count() == users_before and db.query(WhatsAppNumber).count() == numbers_before, "A dry run changes nothing")
     check(purge_demo_data(db, keep_emails=["rahul.sharma@relaycrm.io"], dry_run=True)["deleted"]["users"] == 12, "A listed account can be kept")
     rep = purge_demo_data(db, dry_run=False)
     check(rep["error"] is None, "Cleanup runs")
 with SessionLocal() as db:
     check([u.email for u in db.query(User).all()] == ["boss@example.com"], "Only the real account is left")
-    check(db.query(WhatsAppNumber).count() == real_numbers and not db.query(WhatsAppNumber).filter(WhatsAppNumber.unipile_account_id.is_(None)).count(), "Fake numbers gone, connected numbers kept")
+    check(db.query(WhatsAppNumber).count() == real_numbers + 1 and db.query(WhatsAppNumber).filter(WhatsAppNumber.unipile_account_id.is_(None)).count() == 1
+          and db.query(WhatsAppNumber).filter(WhatsAppNumber.phone == "+15550001111").count() == 1, "Fake numbers gone; connected numbers and the one added by hand kept")
     check(db.query(Conversation).count() == real_convs and db.query(Message).count() == real_msgs, "Real chats and messages are untouched")
     boss_id = db.query(User).first().id
     check(db.query(Contact).filter(Contact.admin_id != boss_id).count() == 0 and db.query(Conversation).filter(Conversation.admin_id != boss_id).count() == 0
@@ -534,7 +813,7 @@ check(client.post("/api/v1/auth/login", json={"email": "rahul.sharma@relaycrm.io
       and client.post("/api/v1/auth/login", json={"email": "deepa@relaycrm.io", "password": "password123"}).status_code == 401, "Demo logins no longer work")
 check(client.post("/api/v1/auth/login", json={"email": "boss@example.com", "password": "newpass-2222"}).status_code == 200, "The real login still works")
 tok2 = client.post("/api/v1/auth/login", json={"email": "boss@example.com", "password": "newpass-2222"}).json()["access_token"]
-check(len(client.get("/api/v1/numbers", headers={"Authorization": f"Bearer {tok2}"}).json()) == real_numbers
+check(len(client.get("/api/v1/numbers", headers={"Authorization": f"Bearer {tok2}"}).json()) == real_numbers + 1
       and client.get("/api/v1/analytics/summary", headers={"Authorization": f"Bearer {tok2}"}).json()["messages_sent"] > 0, "The dashboard now shows only real numbers and figures")
 with SessionLocal() as db:
     check(purge_demo_data(db, dry_run=False).get("note", "").startswith("No demo"), "Running the cleanup again is harmless")

@@ -49,6 +49,7 @@ class MessageType(str, enum.Enum):
     STICKER = "sticker"
     VOICE = "voice"
     NOTE = "note"
+    DOCUMENT = "document"
 
 
 class MessageStatus(str, enum.Enum):
@@ -70,6 +71,9 @@ class Message(Base):
     text: Mapped[str | None] = mapped_column(Text, nullable=True)
     media_url: Mapped[str | None] = mapped_column(String(500), nullable=True)
     duration_seconds: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    media_name: Mapped[str | None] = mapped_column(String(255), nullable=True)      # file name
+    media_type: Mapped[str | None] = mapped_column(String(120), nullable=True)      # mime type
+    media_source: Mapped[str | None] = mapped_column(String(1000), nullable=True)   # where a received file is fetched from
     status: Mapped[MessageStatus] = mapped_column(Enum(MessageStatus, name="message_status"), default=MessageStatus.SENT)
     # Provider tracking — status webhooks find the message by provider_message_id.
     provider_message_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
