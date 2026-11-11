@@ -139,6 +139,22 @@ campaigns with `CAMPAIGN_SEND_INTERVAL_SECONDS` of 5+ to avoid bans); group chat
 not imported or shown, and senders whose phone Unipile doesn't expose (`@lid` with no `public_identifier`) are skipped
 and noted in the activity log. Test without an account: `python test_unipile.py`.
 
+### Live data only (no demo mode, no demo data)
+
+`WHATSAPP_MOCK` defaults to `false`: messages really go out and the connected accounts and
+their chats are imported. Every figure in the app is counted from the real messages
+(`app/services/stats.py`): analytics totals, the per-day charts, each number's messages today /
+delivery rate / reply rate, and the Admin performance table. Numbers' connection status is asked
+from the WhatsApp service every 10 s; the inbox refreshes every 5 s and new messages arrive by webhook.
+
+The demo seed (`python -m app.seed`, accounts `*@relaycrm.io` with the password `password123`) is for
+local development only (`run_dev_sqlite.py` turns mock mode on for it). To remove it from a deployed
+database: set `BOOTSTRAP_ADMIN_EMAIL` / `BOOTSTRAP_ADMIN_PASSWORD` (a real Super Admin must exist),
+then either deploy once with `PURGE_DEMO_DATA=true` (and remove it afterwards) or run
+`python -m app.purge_demo` (dry run) and `python -m app.purge_demo --yes`. It deletes the demo users,
+the fake numbers and everything attached to them; connected numbers and their chats are kept and
+handed to the real Super Admin. `PURGE_KEEP_EMAILS` lists demo-domain accounts to keep.
+
 ### Automations on incoming chats
 
 When a `message.new` comes from someone who is not yet a contact, every **Running**

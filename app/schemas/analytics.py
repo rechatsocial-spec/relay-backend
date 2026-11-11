@@ -24,3 +24,11 @@ class TimeSeriesPoint(BaseModel):
 class FunnelStage(BaseModel):
     name: str
     value: int
+
+
+class TimePoint(BaseModel):
+    date: str
+    sent: int
+    delivered: int
+    read: int
+    received: int

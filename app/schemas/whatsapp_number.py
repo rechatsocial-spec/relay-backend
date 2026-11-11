@@ -27,6 +27,7 @@ class WhatsAppNumberOut(BaseModel):
     admin_id: uuid.UUID
     status: NumberStatus
     messages_today: int
+    admin_name: str | None = None
     chats: int = 0
     unread: int = 0
     delivery_rate: float

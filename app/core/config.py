@@ -13,9 +13,9 @@ class Settings(BaseSettings):
     ALGORITHM: str = "HS256"
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 1440
 
-    # When true, sends are faked (no network call) — local development only.
-    # Set false in production so messages really go out through Unipile.
-    WHATSAPP_MOCK: bool = True
+    # Live by default: messages really go out and real chats are imported.
+    # Only set true on a developer machine (fake sends, no network calls).
+    WHATSAPP_MOCK: bool = False
 
     # Unipile v2. UNIPILE_API_KEY: a Service Key (it also manages webhooks) from
     # the Unipile dashboard > API Keys, sent as X-API-KEY. Keys expire — rotate
@@ -32,6 +32,12 @@ class Settings(BaseSettings):
     # Seconds between campaign messages. These are normal WhatsApp accounts, not
     # the official Business API — keep this at 5+ to protect numbers from bans.
     CAMPAIGN_SEND_INTERVAL_SECONDS: float = 5.0
+
+    # One-time cleanup of the demo seed (see app/services/demo_cleanup.py): set true,
+    # deploy once, then remove it. PURGE_KEEP_EMAILS = comma list of demo-domain
+    # accounts to keep.
+    PURGE_DEMO_DATA: bool = False
+    PURGE_KEEP_EMAILS: str = ""
 
     # Optional first Super Admin, created on startup if that email doesn't exist
     # yet (so production never needs the demo seed). Remove the password

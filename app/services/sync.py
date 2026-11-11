@@ -68,7 +68,8 @@ def _aware(dt: datetime | None) -> datetime | None:
 
 def sync_accounts(db: Session) -> list[WhatsAppNumber]:
     """Makes sure every connected WhatsApp account is a CRM number. Returns the new ones."""
-    owner = db.query(User).filter(User.role == Role.SUPER_ADMIN).order_by(User.created_at).first()
+    supers = db.query(User).filter(User.role == Role.SUPER_ADMIN).order_by(User.created_at).all()
+    owner = next((u for u in supers if not u.email.lower().endswith("@relaycrm.io")), supers[0] if supers else None)  # not the demo account
     if not owner:
         log.warning("No Super Admin exists yet — cannot import numbers")
         return []

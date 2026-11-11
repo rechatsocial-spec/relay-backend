@@ -6,9 +6,9 @@ from sqlalchemy.orm import Session
 
 from app.api.deps import admin_scope_filter
 from app.db.session import get_db
-from app.models.whatsapp_number import WhatsAppNumber
 from app.models.contact import Contact, ContactStatus
-from app.schemas.analytics import AnalyticsSummary, FunnelStage
+from app.schemas.analytics import AnalyticsSummary, FunnelStage, TimePoint
+from app.services.stats import daily_series, message_counts
 
 router = APIRouter(prefix="/analytics", tags=["analytics"])
 
@@ -22,36 +22,35 @@ def summary(
     db: Session = Depends(get_db),
     scope: uuid.UUID | None = Depends(admin_scope_filter),
 ):
-    """
-    NOTE: sent/delivered/read/failed are read from WhatsAppNumber's rolling
-    counters, which are the right place for them once a webhook handler
-    updates them per delivery-status callback. Wire that handler up when
-    WHATSAPP_MOCK flips to false — this endpoint doesn't need to change.
-    """
+    """Totals counted from the actual messages (see app/services/stats.py)."""
     effective_admin = scope or admin_id
-    q = db.query(WhatsAppNumber)
-    if effective_admin:
-        q = q.filter(WhatsAppNumber.admin_id == effective_admin)
-    if number_id:
-        q = q.filter(WhatsAppNumber.id == number_id)
-    numbers = q.all()
-
-    sent = sum(n.messages_today for n in numbers)
-    delivered = round(sent * (sum(n.delivery_rate for n in numbers) / len(numbers) / 100)) if numbers else 0
-    replies = round(sent * (sum(n.reply_rate for n in numbers) / len(numbers) / 100)) if numbers else 0
-    failed = max(sent - delivered, 0)
-    read = round(delivered * 0.65)
+    c = message_counts(db, effective_admin, number_id)
 
     cq = db.query(func.count(Contact.id))
     if effective_admin:
         cq = cq.filter(Contact.admin_id == effective_admin)
+    if number_id:
+        cq = cq.filter(Contact.whatsapp_number_id == number_id)
+    total_contacts = cq.scalar() or 0
     leads = cq.filter(Contact.status.in_(LEAD_STATUSES)).scalar() or 0
-    conversion = round((leads / sent) * 100, 1) if sent else 0.0
+    conversion = round(leads / total_contacts * 100, 1) if total_contacts else 0.0
 
     return AnalyticsSummary(
-        messages_sent=sent, delivered=delivered, read=read, failed=failed,
-        replies=replies, leads=leads, conversion_rate=conversion,
+        messages_sent=c["sent"], delivered=c["delivered"], read=c["read"], failed=c["failed"],
+        replies=c["received"], leads=leads, conversion_rate=conversion,
     )
+
+
+@router.get("/timeseries", response_model=list[TimePoint])
+def timeseries(
+    days: int = Query(14, ge=1, le=90),
+    admin_id: uuid.UUID | None = None,
+    number_id: uuid.UUID | None = None,
+    db: Session = Depends(get_db),
+    scope: uuid.UUID | None = Depends(admin_scope_filter),
+):
+    """Messages per day for the last `days` days (UTC), counted from the actual messages."""
+    return daily_series(db, days, scope or admin_id, number_id)
 
 
 @router.get("/funnel", response_model=list[FunnelStage])

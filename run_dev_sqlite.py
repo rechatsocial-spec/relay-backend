@@ -59,6 +59,7 @@ def main(default_port: int = 8000):
     # SQLite mode always uses its own file, even if .env points at Postgres.
     os.environ["DATABASE_URL"] = "sqlite:///./dev.db"
     os.environ.setdefault("SECRET_KEY", "dev-secret-not-for-production")
+    os.environ.setdefault("WHATSAPP_MOCK", "true")  # demo data + fake sends: local only
     if args.reset and os.path.exists("dev.db"):
         os.remove("dev.db")
 

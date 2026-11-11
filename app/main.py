@@ -1,3 +1,6 @@
+import logging
+import threading
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -5,10 +8,12 @@ from app.core.config import settings
 from app.db.base import Base
 from app.db.session import engine
 from app.db.auto_migrate import upgrade_schema
-from app.bootstrap import ensure_bootstrap_admin
+
+from app.bootstrap import ensure_bootstrap_admin, warn_default_passwords
 from app.services.automation_runner import start_poller
 from app.services.campaign_runner import resume_interrupted_campaigns
 from app.services.sync import start_sync_loop
+from app.services.demo_cleanup import purge_if_requested
 from app.api.v1.api import api_router
 
 app = FastAPI(title=settings.PROJECT_NAME)
@@ -37,6 +42,10 @@ def on_startup():
     Base.metadata.create_all(bind=engine)
     upgrade_schema(engine)  # adds new columns to existing tables (dev convenience)
     ensure_bootstrap_admin()
+    purge_if_requested()  # one-time, only when PURGE_DEMO_DATA=true
+    if not settings.WHATSAPP_MOCK and not settings.UNIPILE_API_KEY:
+        logging.getLogger("relay").error("WhatsApp is live but UNIPILE_API_KEY is not set — nothing can be sent or imported")
+    threading.Thread(target=warn_default_passwords, daemon=True).start()  # bcrypt checks: keep startup fast
     resume_interrupted_campaigns()
     start_sync_loop()  # imports connected WhatsApp accounts and their recent chats
     start_poller()  # runs due automation steps (welcome messages, waits, follow-ups)  # campaigns left Running by a restart carry on

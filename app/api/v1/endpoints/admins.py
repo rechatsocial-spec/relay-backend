@@ -20,6 +20,7 @@ from app.models.conversation import Conversation, Message
 from app.models.user import User, Role
 from app.models.whatsapp_number import WhatsAppNumber
 from app.models.contact import Contact, ContactStatus
+from app.services.stats import message_counts
 from app.schemas.admin import AdminCreate, AdminUpdate, AdminOut, AdminPerformanceOut
 
 log = logging.getLogger("relay.admins")
@@ -34,10 +35,11 @@ def list_admins(db: Session = Depends(get_db)):
     out = []
     for a in admins:
         numbers_count = db.query(func.count(WhatsAppNumber.id)).filter(WhatsAppNumber.admin_id == a.id).scalar() or 0
-        messages_sent = db.query(func.coalesce(func.sum(WhatsAppNumber.messages_today), 0)).filter(WhatsAppNumber.admin_id == a.id).scalar() or 0
+        counts = message_counts(db, admin_id=a.id)
+        messages_sent, replies = counts["sent"], counts["received"]
+        contacts = db.query(func.count(Contact.id)).filter(Contact.admin_id == a.id).scalar() or 0
         leads = db.query(func.count(Contact.id)).filter(Contact.admin_id == a.id, Contact.status.in_(LEAD_STATUSES)).scalar() or 0
-        replies = db.query(func.count(Contact.id)).filter(Contact.admin_id == a.id, Contact.status != ContactStatus.NEW).scalar() or 0
-        conversion = round((leads / messages_sent) * 100, 1) if messages_sent else 0.0
+        conversion = round((leads / contacts) * 100, 1) if contacts else 0.0
         out.append(AdminPerformanceOut(
             **AdminOut.model_validate(a).model_dump(),
             numbers_count=numbers_count, messages_sent=messages_sent,

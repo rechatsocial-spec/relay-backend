@@ -202,6 +202,35 @@ reply = client.post(f"/api/v1/inbox/conversations/{byphone['+919822222222']['id'
 check(fake.calls[-1]["url"].endswith("/acc_456/chats/919822222222@s.whatsapp.net/messages/send") and reply.json()["status"] == "sent",
       "A reply goes out from the number the chat belongs to")
 
+# --- assigning a number moves its whole inbox ------------------------------------
+admins_list = client.get("/api/v1/admins", headers=SA).json()
+other = next(a for a in admins_list if a["id"] != rahul_id)
+other_h = {"Authorization": "Bearer " + client.post("/api/v1/auth/login", json={"email": other["email"], "password": "password123"}).json()["access_token"]}
+def phones(h):
+    return {c["contact"]["phone"] for c in client.get("/api/v1/inbox/conversations", headers=h).json()}
+check("+919822222222" in phones(ADMIN) and "+919822222222" not in phones(other_h), "Before: only the current owner sees the second number's chats")
+check(client.patch(f"/api/v1/numbers/{num2['id']}", headers=ADMIN, json={"admin_id": other["id"]}).status_code == 403, "An Admin cannot reassign a number")
+check(client.patch(f"/api/v1/numbers/{num2['id']}", headers=SA, json={"admin_id": str(uuid.uuid4())}).status_code == 404, "Assigning to an unknown admin is rejected")
+r = client.patch(f"/api/v1/numbers/{num2['id']}", headers=SA, json={"admin_id": other["id"]})
+check(r.status_code == 200 and r.json()["admin_id"] == other["id"] and r.json()["admin_name"] == other["name"], "Super Admin assigns the number to another Admin")
+check("+919822222222" in phones(other_h) and "+919822222222" not in phones(ADMIN), "The chats moved with the number")
+check(any(c["phone"] == "+919822222222" for c in (lambda x: x["items"] if isinstance(x, dict) else x)(client.get("/api/v1/contacts", headers=other_h).json())), "...and so did its contacts")
+check(next(n for n in client.get("/api/v1/numbers", headers=SA).json() if n["id"] == num2["id"])["admin_name"] == other["name"], "Numbers list shows who each number is assigned to")
+check("assigned" in json.dumps(client.get("/api/v1/activity-logs", headers=SA).json()), "Assignment is recorded in the activity log")
+client.patch(f"/api/v1/numbers/{num2['id']}", headers=SA, json={"admin_id": rahul_id})
+check("+919822222222" in phones(ADMIN), "Assigning it back restores the owner's inbox")
+
+# --- demo-password warning ------------------------------------------------------
+import logging  # noqa: E402
+from app.bootstrap import warn_default_passwords  # noqa: E402
+records = []
+class _H(logging.Handler):
+    def emit(self, rec): records.append(rec.getMessage())
+h = _H(); logging.getLogger("relay.bootstrap").addHandler(h)
+warn_default_passwords()
+logging.getLogger("relay.bootstrap").removeHandler(h)
+check(any("demo password" in m and "deepa@relaycrm.io" in m for m in records), "Startup warns about accounts that still use the demo password")
+
 st = client.get("/api/v1/system/whatsapp", headers=ADMIN).json()
 check(st["provider"] == "whatsapp" and st["credentials_set"] and st["inbound_webhook_url"] == "https://crm.example.com/api/v1/whatsapp/webhook", "/system/whatsapp reports live + neutral webhook URL")
 
@@ -296,6 +325,48 @@ with SessionLocal() as db:
 check(webhook({"type": "message.new", "account_id": "acc_unknown", "payload": {"id": "z"}}).status_code == 200, "Events for unknown accounts are acknowledged, not errors")
 
 
+
+# --- real figures: every number is counted from the messages ----------------------
+from datetime import datetime as _dt, timezone as _tz  # noqa: E402
+from app.models.conversation import Conversation, MessageType  # noqa: E402
+with SessionLocal() as db:
+    rows = db.query(Message, Conversation.admin_id, Conversation.whatsapp_number_id, Conversation.id).join(
+        Conversation, Conversation.id == Message.conversation_id).filter(Message.type != MessageType.NOTE).all()
+today = _dt.now(_tz.utc).date()
+def _day(m):
+    d = m.created_at
+    return (d.replace(tzinfo=_tz.utc) if d.tzinfo is None else d).astimezone(_tz.utc).date()
+def expected(pred):
+    out = [r for r in rows if pred(r) and r[0].sender.value in ("business", "bot")]
+    st = lambda *names: sum(r[0].status.value in names for r in out)
+    return {"sent": st("sent", "delivered", "read"), "delivered": st("delivered", "read"), "read": st("read"),
+            "failed": st("failed", "undelivered"), "received": sum(r[0].sender.value == "customer" for r in rows if pred(r))}
+allx = expected(lambda r: True)
+tot = client.get("/api/v1/analytics/summary", headers=SA).json()
+check((tot["messages_sent"], tot["delivered"], tot["read"], tot["failed"], tot["replies"]) ==
+      (allx["sent"], allx["delivered"], allx["read"], allx["failed"], allx["received"]), "Analytics totals equal the real message counts")
+check(allx["sent"] > 0 and allx["read"] > 0 and allx["failed"] > 0 and allx["received"] > 0 and tot["read"] != round(tot["delivered"] * 0.65), "...and 'read' is counted, not estimated from delivered")
+rx = expected(lambda r: str(r[1]) == rahul_id)
+mine = client.get("/api/v1/analytics/summary", headers=ADMIN).json()
+check((mine["messages_sent"], mine["delivered"], mine["read"], mine["failed"], mine["replies"]) == (rx["sent"], rx["delivered"], rx["read"], rx["failed"], rx["received"]),
+      "An Admin's analytics only count their own chats")
+ts = client.get("/api/v1/analytics/timeseries", headers=SA).json()
+check(len(ts) == 14 and ts[-1]["date"] == today.isoformat() and [t["date"] for t in ts] == sorted(t["date"] for t in ts), "Time series: last 14 days, ending today")
+sent_today = sum(1 for r in rows if r[0].sender.value in ("business", "bot") and r[0].status.value in ("sent", "delivered", "read") and _day(r[0]) == today)
+check(ts[-1]["sent"] == sent_today and sent_today > 0, "Today's point equals the messages really sent today")
+check(sum(t["received"] for t in ts) == sum(1 for r in rows if r[0].sender.value == "customer" and (today - _day(r[0])).days < 14), "Received per day adds up to the real inbound messages")
+check(client.get("/api/v1/analytics/timeseries", headers=SA, params={"days": 500}).status_code == 422, "Time series range is bounded")
+nlist = client.get("/api/v1/numbers", headers=SA).json()
+n1 = next(n for n in nlist if n["id"] == num["id"])
+x1 = [r for r in rows if str(r[2]) == num["id"] and r[0].sender.value in ("business", "bot")]
+ok1 = [r for r in x1 if r[0].status.value in ("sent", "delivered", "read")]
+dlv = [r for r in ok1 if r[0].status.value in ("delivered", "read")]
+wrote = {r[3] for r in ok1}
+answered = {r[3] for r in rows if str(r[2]) == num["id"] and r[0].sender.value == "customer"}
+check(n1["messages_today"] == sum(_day(r[0]) == today for r in ok1) and n1["messages_today"] > 0, "A number's 'messages today' is counted from its messages")
+check(n1["delivery_rate"] == round(len(dlv) / len(ok1) * 100, 1) and n1["reply_rate"] == round(len(wrote & answered) / len(wrote) * 100, 1), "Delivery and reply rates are computed, not stored")
+adm = next(a for a in client.get("/api/v1/admins", headers=SA).json() if a["id"] == rahul_id)
+check(adm["messages_sent"] == rx["sent"] and adm["replies"] == rx["received"], "Admin performance table uses the real counts")
 
 # --- change password -------------------------------------------------------------
 H = lambda t: {"Authorization": f"Bearer {t}"}
@@ -431,6 +502,42 @@ n4 = len(fake.calls)
 fast_forward()
 ar.process_due_runs()
 check(len(fake.calls) == n4, "Pausing the automation stops runs that are waiting")
+
+# --- demo-data cleanup ------------------------------------------------------------
+from app.services.demo_cleanup import purge_demo_data  # noqa: E402
+from app.models.user import User  # noqa: E402
+from app.models.contact import Contact  # noqa: E402
+from app.models.campaign import Campaign  # noqa: E402
+from app.models.chatbot import Chatbot  # noqa: E402
+from app.models.api_key import ApiKey  # noqa: E402
+with SessionLocal() as db:
+    real_numbers = db.query(WhatsAppNumber).filter(WhatsAppNumber.unipile_account_id.isnot(None)).count()
+    real_convs = db.query(Conversation).join(WhatsAppNumber, WhatsAppNumber.id == Conversation.whatsapp_number_id).filter(WhatsAppNumber.unipile_account_id.isnot(None)).count()
+    real_msgs = db.query(Message).join(Conversation, Conversation.id == Message.conversation_id).join(WhatsAppNumber, WhatsAppNumber.id == Conversation.whatsapp_number_id).filter(WhatsAppNumber.unipile_account_id.isnot(None)).count()
+    users_before, numbers_before = db.query(User).count(), db.query(WhatsAppNumber).count()
+    dry = purge_demo_data(db, dry_run=True)
+    check(dry["error"] is None and dry["new_owner"] == "boss@example.com" and dry["deleted"]["numbers"] == numbers_before - real_numbers and dry["deleted"]["users"] == 13,
+          "Dry run lists the demo data and who inherits the real numbers")
+    check(db.query(User).count() == users_before and db.query(WhatsAppNumber).count() == numbers_before, "A dry run changes nothing")
+    check(purge_demo_data(db, keep_emails=["rahul.sharma@relaycrm.io"], dry_run=True)["deleted"]["users"] == 12, "A listed account can be kept")
+    rep = purge_demo_data(db, dry_run=False)
+    check(rep["error"] is None, "Cleanup runs")
+with SessionLocal() as db:
+    check([u.email for u in db.query(User).all()] == ["boss@example.com"], "Only the real account is left")
+    check(db.query(WhatsAppNumber).count() == real_numbers and not db.query(WhatsAppNumber).filter(WhatsAppNumber.unipile_account_id.is_(None)).count(), "Fake numbers gone, connected numbers kept")
+    check(db.query(Conversation).count() == real_convs and db.query(Message).count() == real_msgs, "Real chats and messages are untouched")
+    boss_id = db.query(User).first().id
+    check(db.query(Contact).filter(Contact.admin_id != boss_id).count() == 0 and db.query(Conversation).filter(Conversation.admin_id != boss_id).count() == 0
+          and db.query(WhatsAppNumber).filter(WhatsAppNumber.admin_id != boss_id).count() == 0, "What demo users owned now belongs to the real account")
+    check(db.query(Campaign).count() == 0 and db.query(Chatbot).count() == 0 and db.query(ApiKey).count() == 0, "Demo campaigns, chatbots and keys are gone")
+check(client.post("/api/v1/auth/login", json={"email": "rahul.sharma@relaycrm.io", "password": "password123"}).status_code == 401
+      and client.post("/api/v1/auth/login", json={"email": "deepa@relaycrm.io", "password": "password123"}).status_code == 401, "Demo logins no longer work")
+check(client.post("/api/v1/auth/login", json={"email": "boss@example.com", "password": "newpass-2222"}).status_code == 200, "The real login still works")
+tok2 = client.post("/api/v1/auth/login", json={"email": "boss@example.com", "password": "newpass-2222"}).json()["access_token"]
+check(len(client.get("/api/v1/numbers", headers={"Authorization": f"Bearer {tok2}"}).json()) == real_numbers
+      and client.get("/api/v1/analytics/summary", headers={"Authorization": f"Bearer {tok2}"}).json()["messages_sent"] > 0, "The dashboard now shows only real numbers and figures")
+with SessionLocal() as db:
+    check(purge_demo_data(db, dry_run=False).get("note", "").startswith("No demo"), "Running the cleanup again is harmless")
 
 httpx.get = httpx_get
 print(f"\n{passed} passed, {failed} failed")
