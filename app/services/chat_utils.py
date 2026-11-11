@@ -73,14 +73,22 @@ def attachment_fields(att: dict | None, message_id) -> dict:
     }
 
 
-def is_person_chat(chat_id: str | None) -> bool:
-    """A 1:1 chat with a person. Groups, status, newsletters and WhatsApp's own system chat are not customers."""
-    low = (chat_id or "").lower()
-    if low.endswith("@lid"):
+def is_system_chat(chat_id: str | None) -> bool:
+    """True only for chats that are DEFINITELY not a customer: groups, broadcast/status, newsletters, and
+    WhatsApp's own account ('0@s.whatsapp.net'). An id in any other format is treated as a customer, so
+    nothing real is ever skipped or removed because of an id shape we did not expect."""
+    low = (chat_id or "").strip().lower()
+    if not low:
         return True
-    if low.endswith("@s.whatsapp.net"):
-        return len(re.sub(r"\D", "", low.split("@", 1)[0])) >= 7
+    if low.endswith(("@g.us", "@broadcast", "@newsletter")) or low.startswith("status@"):
+        return True
+    if low.endswith("@s.whatsapp.net") and len(re.sub(r"\D", "", low.split("@", 1)[0])) < 7:
+        return True
     return False
+
+
+def is_person_chat(chat_id: str | None) -> bool:
+    return not is_system_chat(chat_id)
 
 
 def lid_placeholder(user_id: str | None) -> str:

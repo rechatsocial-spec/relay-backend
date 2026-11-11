@@ -32,6 +32,7 @@ from app.models.whatsapp_number import NumberStatus, WhatsAppNumber
 from app.services.automation_runner import start_keyword_automations, start_new_customer_automations
 from app.services.chat_utils import attachment_fields, digits_to_phone, find_contact, is_person_chat, lid_placeholder, phone_from_user_id
 from app.services.messaging import get_or_create_conversation, utcnow
+from app.services.sync import _aware, _ts
 
 log = logging.getLogger("relay.unipile")
 router = APIRouter(tags=["whatsapp"])  # mounted at /whatsapp (and legacy /unipile) in api.py
@@ -100,15 +101,61 @@ def _resolve_phone(number: WhatsAppNumber, m: dict) -> str | None:
     return None
 
 
+def _store_own_message(db: Session, number: WhatsAppNumber, m: dict, chat_id: str) -> None:
+    """A message the account owner sent (from the phone or another device, or from this app): message.new
+    reports those too (is_sender). Shown in the thread as ours, in real time. No unread, no automations."""
+    mid = m.get("id")
+    conv = db.query(Conversation).filter(Conversation.provider_chat_id == chat_id, Conversation.whatsapp_number_id == number.id).first()
+    if conv is None:
+        phone = phone_from_user_id(chat_id)
+        if not phone:
+            try:
+                r = httpx.get(_api(f"/{number.unipile_account_id}/users/{chat_id}"), headers=_headers(), timeout=15)
+                phone = digits_to_phone(r.json().get("public_identifier")) if r.status_code < 300 else None
+            except (httpx.HTTPError, HTTPException, ValueError):
+                phone = None
+        key = phone or lid_placeholder(chat_id)
+        contact = find_contact(db, number, key)
+        if contact is None:
+            contact = Contact(name=(phone or "WhatsApp contact")[:120], phone=key, whatsapp_number_id=number.id, admin_id=number.admin_id,
+                              status=ContactStatus.CONTACTED, tags=["WhatsApp"], source="Sent from the phone")
+            db.add(contact)
+            db.flush()
+        conv = get_or_create_conversation(db, contact, number)
+        conv.provider_chat_id = chat_id
+    when = _ts(m.get("timestamp")) or utcnow()
+    text = m.get("text") or None
+    # sent from this app a moment ago and stored under another id? Then it is the same message: adopt the id.
+    for twin in (db.query(Message).filter(Message.conversation_id == conv.id, Message.sender == MessageSender.BUSINESS,
+                                          Message.type != MessageType.NOTE).order_by(Message.created_at.desc()).limit(5).all()):
+        if (twin.text or None) == text and twin.provider_message_id != mid and abs((_aware(twin.created_at) - when).total_seconds()) < 30:
+            twin.provider_message_id = mid
+            db.commit()
+            return
+    first = (m.get("attachments") or [None])[0]
+    mid_local = uuid.uuid4()
+    fields = {"type": MessageType.TEXT, **attachment_fields(first, mid_local)}
+    status = MessageStatus.READ if m.get("is_seen") else MessageStatus.DELIVERED if m.get("is_delivered") else MessageStatus.SENT
+    db.add(Message(id=mid_local, conversation_id=conv.id, sender=MessageSender.BUSINESS, text=text, status=status,
+                   provider_message_id=mid, created_at=when, **fields))
+    if conv.last_message_at is None or when > _aware(conv.last_message_at):
+        conv.last_message_at = when
+    number.last_activity_at = utcnow()
+    db.commit()
+
+
 def _handle_message_new(db: Session, number: WhatsAppNumber, m: dict) -> None:
-    if m.get("is_sender") or m.get("is_event"):
-        return  # our own message (sent via the API or the phone) / a system event
+    if m.get("is_event"):
+        return  # a system event
     mid = m.get("id")
     if mid and db.query(Message).filter(Message.provider_message_id == mid).first():
-        return  # webhook retry
+        return  # webhook retry, or a message this app already stored
     chat_id = m.get("chat_id") or ""
     if not is_person_chat(chat_id):
         return  # groups, status, newsletters, WhatsApp's own system chat: not CRM customers
+    if m.get("is_sender"):
+        _store_own_message(db, number, m, chat_id)
+        return
     sender_id = m.get("sender_id") or chat_id
     conv = db.query(Conversation).filter(Conversation.provider_chat_id == chat_id, Conversation.whatsapp_number_id == number.id).first()
     is_new_customer = False

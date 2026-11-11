@@ -49,6 +49,22 @@ def get_or_create_conversation(db: Session, contact: Contact, number: WhatsAppNu
     return conv
 
 
+def _record(db: Session, conversation: Conversation, **fields) -> Message:
+    """Stores a message we just sent. If Unipile's own notification of it (message.new, is_sender) got here
+    first, that row is completed instead of adding a second bubble."""
+    pid = fields.get("provider_message_id")
+    if pid:
+        existing = db.query(Message).filter(Message.provider_message_id == pid, Message.conversation_id == conversation.id).first()
+        if existing is not None:
+            for k in ("text", "media_url", "media_name", "media_type", "duration_seconds", "campaign_id"):
+                if fields.get(k) is not None:
+                    setattr(existing, k, fields[k])
+            return existing
+    message = Message(conversation_id=conversation.id, sender=MessageSender.BUSINESS, **fields)
+    db.add(message)
+    return message
+
+
 def send_message(
     db: Session,
     whatsapp: WhatsAppServiceInterface,
@@ -74,15 +90,14 @@ def send_message(
     else:
         result = SendResult(False, None, error="A media URL is required for this message type")
 
-    message = Message(
-        conversation_id=conversation.id, sender=MessageSender.BUSINESS, type=msg_type,
+    message = _record(
+        db, conversation, type=msg_type,
         text=text, media_url=media_url, duration_seconds=duration_seconds,
         status=MessageStatus.SENT if result.success else MessageStatus.FAILED,
         provider_message_id=result.provider_message_id,
         error_code=result.error_code, error_message=result.error,
         campaign_id=campaign_id,
     )
-    db.add(message)
     now = utcnow()
     conversation.last_message_at = now
     contact.last_contact_at = now
@@ -108,13 +123,12 @@ def send_attachment_message(
         mtype = MessageType.VOICE
     else:
         mtype = MessageType.DOCUMENT
-    message = Message(
-        conversation_id=conversation.id, sender=MessageSender.BUSINESS, type=mtype, text=caption or None, media_url=media_url,
+    message = _record(
+        db, conversation, type=mtype, text=caption or None, media_url=media_url,
         media_name=filename[:255], media_type=content_type[:120], duration_seconds=duration if voice_note else None,
         status=MessageStatus.SENT if result.success else MessageStatus.FAILED,
         provider_message_id=result.provider_message_id, error_code=result.error_code, error_message=result.error,
     )
-    db.add(message)
     now = utcnow()
     conversation.last_message_at = now
     contact.last_contact_at = now

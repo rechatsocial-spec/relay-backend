@@ -146,23 +146,38 @@ class UnipileWhatsAppService(WhatsAppServiceInterface):
             db.close()
         return None
 
+    def _find_chat(self, base: str, headers: dict, jid: str) -> str | None:
+        """GET /{account}/users/{user_id}/chat: the existing conversation with this person, if there is one."""
+        try:
+            r = self.http.get(f"{base}/users/{jid}/chat", headers=headers)
+            if r.status_code >= 300:
+                return None
+            body = r.json()
+            found = body.get("id") or (body.get("data") or {}).get("id") if isinstance(body, dict) else None
+            return str(found) if found else None
+        except Exception:
+            return None
+
     def _send(self, from_number: str, to: str, text: str, attachments: list | None = None, chat_id: str | None = None) -> SendResult:
         account_id = self._account_id_for(from_number)
         if not account_id:
             return SendResult(False, None, error=f"{from_number} is not linked yet — link the number first",
                               error_code="unipile_not_linked")
         jid = f"{to_e164(to).lstrip('+')}@s.whatsapp.net"
-        chat_id = chat_id or self._chat_id_for(account_id, to) or jid  # the chat's own id when we know it (@lid people)
+        chat_id = chat_id or self._chat_id_for(account_id, to)  # the chat's own id when we know it (@lid people)
         base = f"{settings.UNIPILE_BASE_URL.rstrip('/')}/{account_id}"
         headers = {"X-API-KEY": settings.UNIPILE_API_KEY, "accept": "application/json"}
         try:
-            # Existing 1:1 chat: its chat_id is the recipient's id (WhatsApp quickstart).
             body_out = {"text": text or ""}
             if attachments:
                 body_out["attachments"] = attachments
-            r = self.http.post(f"{base}/chats/{chat_id}/messages/send", json=body_out, headers=headers)
-            if r.status_code == 404:
-                # No chat with this person yet -> start one with the first message.
+            if not chat_id:
+                chat_id = self._find_chat(base, headers, jid)  # "Find Chats by User": reuse the chat that already exists
+            r = None
+            if chat_id:
+                r = self.http.post(f"{base}/chats/{chat_id}/messages/send", json=body_out, headers=headers)
+            if r is None or r.status_code == 404:
+                # No chat with this person yet -> start one with the first message (number@s.whatsapp.net for a new conversation).
                 r = self.http.post(f"{base}/chats/send", json={"users_ids": jid, **body_out}, headers=headers)
             try:
                 body = r.json()

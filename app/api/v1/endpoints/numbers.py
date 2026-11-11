@@ -55,10 +55,10 @@ def list_numbers(
 
 
 @router.post("/refresh", dependencies=[Depends(require_super_admin)])
-def refresh_numbers():
+def refresh_numbers(full: bool = False):
     """Reads the connected WhatsApp accounts right now and returns what happened (including the error, if any).
-    Chats are imported in the background."""
-    return refresh_now()
+    Chats are imported in the background. ?full=true reads every number's chats again from the service."""
+    return refresh_now(full=full)
 
 
 @router.get("/live-status")

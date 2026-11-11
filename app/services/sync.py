@@ -31,7 +31,9 @@ from app.models.contact import Contact, ContactStatus
 from app.models.conversation import Conversation, Message, MessageSender, MessageStatus, MessageType
 from app.models.user import Role, User
 from app.models.whatsapp_number import NumberStatus, WhatsAppNumber
-from app.services.chat_utils import attachment_fields, digits_to_phone, find_contact, is_person_chat, lid_placeholder, phone_from_user_id
+from app.services.chat_utils import (
+    attachment_fields, digits_to_phone, find_contact, is_person_chat, is_system_chat, lid_placeholder, phone_from_user_id,
+)
 from app.services.connection_status import _MAP
 from app.services.messaging import get_or_create_conversation, utcnow
 
@@ -39,8 +41,8 @@ log = logging.getLogger("relay.sync")
 
 SYNC_SECONDS = 60
 CHAT_PAGE = 50
-MAX_CHATS = 100          # per number, first import
-MESSAGES_PER_CHAT = 30
+MAX_CHATS = 200          # per number, first import
+MESSAGES_PER_CHAT = 40
 PAUSE_SECONDS = 0.2
 
 STATE = {"last_run_at": None, "last_ok_at": None, "error": None, "accounts_found": 0, "imported_chats": 0, "history_importing": False,
@@ -174,14 +176,19 @@ def _profile(account_id: str, user_id: str) -> dict:
 
 
 def purge_system_chats(db: Session) -> int:
-    """Removes chats that are not customers (WhatsApp's own '+0' chat, groups, status...) imported by an earlier version."""
+    """Removes chats an earlier version imported that are DEFINITELY not customers (WhatsApp's own '+0' chat, groups,
+    status). Safety: a chat in which anyone ever wrote from this app is never removed, and an id in an unknown
+    format is never treated as a system chat."""
     removed = 0
     for conv in db.query(Conversation).filter(Conversation.provider_chat_id.isnot(None)).all():
-        if is_person_chat(conv.provider_chat_id):
+        if not is_system_chat(conv.provider_chat_id):
             continue
+        if db.query(Message).filter(Message.conversation_id == conv.id, Message.sender == MessageSender.BUSINESS).first():
+            continue  # someone replied here: keep it, whatever the id looks like
         db.query(AutomationRun).filter(AutomationRun.conversation_id == conv.id).delete(synchronize_session=False)
         db.query(Message).filter(Message.conversation_id == conv.id).delete(synchronize_session=False)
         contact_id = conv.contact_id
+        log.warning("Removing system chat %s", conv.provider_chat_id)
         db.delete(conv)
         db.flush()
         if not db.query(Conversation).filter(Conversation.contact_id == contact_id).first():
@@ -190,7 +197,6 @@ def purge_system_chats(db: Session) -> int:
         removed += 1
     if removed:
         db.commit()
-        log.warning("Removed %s non-customer chats (WhatsApp system chat, groups...)", removed)
     return removed
 
 
@@ -198,7 +204,7 @@ def _import_chat(db: Session, number: WhatsAppNumber, chat: dict) -> int:
     """Imports one chat. Returns how many messages were new."""
     chat_id = chat.get("id")
     acc = number.unipile_account_id
-    if not chat_id or not is_person_chat(chat_id):
+    if not chat_id or not is_person_chat(chat_id) or chat.get("type") in ("group", "channel") or chat.get("is_group") or chat.get("is_channel"):
         return 0
     messages = (_get(f"/{acc}/chats/{chat_id}/messages", {"limit": MESSAGES_PER_CHAT}).get("data")) or []
     items = []
@@ -386,6 +392,9 @@ def _chats_step() -> None:
             log.exception("Could not remove non-customer chats")
         for n in db.query(WhatsAppNumber).filter(WhatsAppNumber.unipile_account_id.isnot(None)).all():
             try:
+                if n.history_synced_at is not None and not db.query(Conversation).filter(Conversation.whatsapp_number_id == n.id).first():
+                    n.history_synced_at = None  # marked as imported but nothing is here: import again
+                    db.commit()
                 if n.history_synced_at is None:
                     STATE["imported_chats"] += sync_history(db, n)
                 else:
@@ -409,11 +418,21 @@ def sync_all() -> dict | None:
     return report
 
 
-def refresh_now() -> dict:
-    """Super Admin 'Refresh': accounts right now (so the answer is real), chats in the background."""
+def refresh_now(full: bool = False) -> dict:
+    """Super Admin 'Refresh': accounts right now (so the answer is real), chats in the background.
+    full=True also marks every number as not yet imported, so all its chats are read again from the service
+    (nothing is deleted; messages already here are matched by id and skipped)."""
     if not _is_live():
         return {"ok": False, "error": "WhatsApp is not live: set UNIPILE_API_KEY (and WHATSAPP_MOCK must not be true)."}
     report = _accounts_step()
+    if full and report["ok"]:
+        db = SessionLocal()
+        try:
+            db.query(WhatsAppNumber).filter(WhatsAppNumber.unipile_account_id.isnot(None)).update({WhatsAppNumber.history_synced_at: None})
+            db.commit()
+        finally:
+            db.close()
+        report["reimport"] = True
     if report["ok"] and not _work_lock.locked():
         threading.Thread(target=_chats_step, daemon=True, name="chat-sync-now").start()
     report["history_importing"] = True

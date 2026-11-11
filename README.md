@@ -172,6 +172,20 @@ keywords: whole words, any capitals, at most once per chat per automation per 24
 for a person". The standard flow (welcome, wait 2 hours, replied? yes: hand over, no: follow-up) comes first.
 Each message step shows its text on the flow with **Write message** and **+ Add variant**.
 
+### How the Unipile guide's pieces are used
+
+- **List chats / list messages** import and catch up each number's chats (`sync.py`); a chat id is used exactly as returned.
+- **`message.new` webhook** reports received messages *and* messages the account owner sends (`is_sender`): received ones
+  are customers' messages; sent ones (from the phone, another device, or this app) are shown as ours in real time without
+  adding unread or starting automations. A message this app sent is never shown twice (matched by id, or by text within 30 s).
+- **Find Chats by User** (`GET /{account}/users/{id}/chat`) finds the existing chat when there is no stored chat id
+  (campaigns, first contact); a brand-new conversation is started with `number@s.whatsapp.net`.
+- **Never used:** Delete a Chat / Delete a Message. Nothing in this app deletes chats at the source.
+- **Real chats are never removed by the app**: only definite non-customers (WhatsApp's own account, groups, status,
+  newsletters) are ever cleaned up, and never a chat anyone replied in. Super Admin -> WhatsApp Numbers -> **Re-import chats**
+  reads every chat of every number again from Unipile (deletes nothing, adds no duplicates); a number that says it was
+  imported but holds no chats is imported again automatically.
+
 ### Which chats are imported, and people WhatsApp hides
 
 Only one-to-one chats with people are customers. WhatsApp's own system chat (`0@s.whatsapp.net`, which showed up as

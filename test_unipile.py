@@ -47,6 +47,9 @@ class FakeHttp:
         self.calls = []
         self.fail = False
         self.new_chat = False
+        self.fixed_id = None
+        self.user_chats = {}   # jid -> existing chat id, for GET /{account}/users/{jid}/chat
+        self.gets = []
 
     def post(self, url, json=None, headers=None):
         self.calls.append({"url": url, "json": json, "headers": headers})
@@ -54,9 +57,15 @@ class FakeHttp:
             return httpx.Response(404, json={"detail": "chat not found"})
         if self.fail:
             return httpx.Response(422, json={"detail": "Recipient is not on WhatsApp"})
-        return httpx.Response(200, json={"object": "ChatStarted", "chat_id": "c1", "message_id": f"msg_{len(self.calls)}"})
+        return httpx.Response(200, json={"object": "ChatStarted", "chat_id": "c1", "message_id": self.fixed_id or f"msg_{len(self.calls)}"})
 
-    def get(self, url, follow_redirects=True):
+    def get(self, url, headers=None, follow_redirects=True):
+        if "/users/" in url and url.endswith("/chat"):
+            self.gets.append(url)
+            jid = url.split("/users/")[1][: -len("/chat")]
+            if jid in self.user_chats:
+                return httpx.Response(200, json={"object": "Chat", "id": self.user_chats[jid]}, request=httpx.Request("GET", url))
+            return httpx.Response(404, json={"detail": "no chat"}, request=httpx.Request("GET", url))
         return httpx.Response(200, content=b"\x89PNG-bytes", headers={"content-type": "image/png"},
                               request=httpx.Request("GET", url))
 
@@ -271,12 +280,18 @@ check(webhook({"type": "message.new", "account_id": "acc_123", "payload": {"id":
 
 before = len(client.get(f"/api/v1/inbox/conversations/{conv['id']}", headers=ADMIN).json()["messages"])
 n_before = len(client.get("/api/v1/inbox/conversations", headers=ADMIN).json())
-inbound("m_own", sender="919876500001@s.whatsapp.net", is_sender=True)
 inbound("m_grp", sender="12345@g.us")
 inbound("m_sys", sender="0@s.whatsapp.net")
 after = len(client.get(f"/api/v1/inbox/conversations/{conv['id']}", headers=ADMIN).json()["messages"])
 check(before == after and len(client.get("/api/v1/inbox/conversations", headers=ADMIN).json()) == n_before,
-      "Own messages, group chats and WhatsApp's own system chat are ignored")
+      "Group chats and WhatsApp's own system chat are ignored")
+unread_before = next(c for c in client.get("/api/v1/inbox/conversations", headers=ADMIN).json() if c["id"] == conv["id"])["unread_count"]
+inbound("m_own", "Replying from my phone", sender="919876500001@s.whatsapp.net", is_sender=True)
+d_own = client.get(f"/api/v1/inbox/conversations/{conv['id']}", headers=ADMIN).json()
+mine = [m for m in d_own["messages"] if m["text"] == "Replying from my phone"]
+check(len(mine) == 1 and mine[0]["sender"] == "business" and mine[0]["status"] == "sent", "A message sent from the phone (message.new with is_sender) shows in the thread as ours, live")
+inbound("m_own", "Replying from my phone", sender="919876500001@s.whatsapp.net", is_sender=True)
+check(len([m for m in client.get(f"/api/v1/inbox/conversations/{conv['id']}", headers=ADMIN).json()["messages"] if m["text"] == "Replying from my phone"]) == 1, "...and a repeated notification does not add it twice")
 inbound("m_lid", "hidden number here", sender="999@lid")  # WhatsApp shares no phone at all
 lid999 = next((c for c in client.get("/api/v1/inbox/conversations", headers=ADMIN).json() if c["contact"]["phone"] == "lid:999"), None)
 check(lid999 is not None and lid999["unread_count"] == 1, "A sender WhatsApp identifies only by a hidden id is not lost: the chat is created")
@@ -932,6 +947,111 @@ with SessionLocal() as db:
     check(sync.purge_system_chats(db) == 1 and db.query(Conversation).count() == total - 1 and db.query(Contact).filter(Contact.phone == "+0").count() == 0,
           "A leftover 'WhatsApp Business +0' chat from the old importer is removed automatically")
     check(sync.purge_system_chats(db) == 0, "...and real chats are untouched")
+
+# --- real chats are never lost: unknown id formats, replied chats, recovery -----------
+from app.services.chat_utils import is_system_chat as _is_sys  # noqa: E402
+from app.models.automation import AutomationRun as _AR  # noqa: E402
+check(all(_is_sys(i) for i in ("0@s.whatsapp.net", "120363111@g.us", "status@broadcast", "123@newsletter", "", None, "123@s.whatsapp.net")),
+      "Only definite non-customers count as system chats (WhatsApp's own account, groups, status, newsletters)")
+check(not any(_is_sys(i) for i in ("919811111111@s.whatsapp.net", "148257303814325@lid", "ch_8f2a91", "919811111111@c.us", "1234567@s.whatsapp.net", "AbC-123")),
+      "An id in ANY other format is a customer: nothing real is ever skipped or removed because of its shape")
+
+with SessionLocal() as db:
+    n456 = db.query(WhatsAppNumber).filter(WhatsAppNumber.unipile_account_id == "acc_456").first()
+    # the scenario that lost chats: a real chat whose id is not a '@s.whatsapp.net' / '@lid' id, and one the team replied in
+    odd = Contact(name="Odd Id Customer", phone="+919855550001", whatsapp_number_id=n456.id, admin_id=n456.admin_id, tags=["WhatsApp"])
+    db.add(odd); db.flush()
+    odd_conv = Conversation(contact_id=odd.id, whatsapp_number_id=n456.id, admin_id=n456.admin_id, provider_chat_id="ch_8f2a91")
+    db.add(odd_conv); db.flush()
+    db.add(Message(conversation_id=odd_conv.id, sender=MessageSender.CUSTOMER, type=MessageType.TEXT, text="my real question", status=MessageStatus.DELIVERED))
+    db.add(Message(conversation_id=odd_conv.id, sender=MessageSender.BUSINESS, type=MessageType.TEXT, text="our real answer", status=MessageStatus.READ))
+    replied_sys = Contact(name="Replied here", phone="+919855550002", whatsapp_number_id=n456.id, admin_id=n456.admin_id, tags=["WhatsApp"])
+    db.add(replied_sys); db.flush()
+    sys_conv = Conversation(contact_id=replied_sys.id, whatsapp_number_id=n456.id, admin_id=n456.admin_id, provider_chat_id="120363777@g.us")
+    db.add(sys_conv); db.flush()
+    db.add(Message(conversation_id=sys_conv.id, sender=MessageSender.BUSINESS, type=MessageType.TEXT, text="we wrote here", status=MessageStatus.SENT))
+    db.commit()
+    check(sync.purge_system_chats(db) == 0 and db.get(Conversation, odd_conv.id) is not None, "The clean-up leaves a chat with an unrecognised id format alone")
+    check(db.get(Conversation, sys_conv.id) is not None and db.query(Message).filter(Message.conversation_id == sys_conv.id).count() == 1, "...and even a system-looking chat is kept if the team ever replied in it")
+
+    # a chat whose id has another shape is imported, and answered at that id
+    CHATS["acc_456"].append({"id": "ch_odd9", "name": "Odd Id Person", "user_id": "919855550009@s.whatsapp.net", "unread_count": 0})
+    CHATS["acc_456"].append({"id": "ch_grp9", "name": "Some group", "user_id": None, "type": "group", "unread_count": 0})
+    MESSAGES["ch_odd9"] = [_m("odd_1", "hello from an odd id", "2026-11-10T13:00:00.000Z")]
+    MESSAGES["ch_grp9"] = [_m("grp_9", "group talk", "2026-11-10T13:01:00.000Z")]
+    sync.sync_history(db, n456)
+    oc = db.query(Conversation).filter(Conversation.provider_chat_id == "ch_odd9").first()
+    check(oc is not None and db.get(Contact, oc.contact_id).phone == "+919855550009", "A chat with an unusual id is imported (the person's phone comes from the person id)")
+    check(db.query(Conversation).filter(Conversation.provider_chat_id == "ch_grp9").count() == 0, "...while a chat the service marks as a group is not")
+oc_id = str(oc.id)
+client.post(f"/api/v1/inbox/conversations/{oc_id}/messages", headers=SA, json={"type": "text", "text": "reply to odd"})
+check(fake.calls[-1]["url"].endswith("/acc_456/chats/ch_odd9/messages/send"), "...and you can reply: it goes to that exact chat id")
+
+# every chat of a number disappears -> they come back from the service by themselves, without duplicates
+def wait_idle():
+    for _ in range(80):
+        if not sync.STATE["history_importing"]:
+            return
+        __import__("time").sleep(0.1)
+with SessionLocal() as db:
+    n456 = db.query(WhatsAppNumber).filter(WhatsAppNumber.unipile_account_id == "acc_456").first()
+    ids = [c.id for c in db.query(Conversation).filter(Conversation.whatsapp_number_id == n456.id).all()]
+    cids = [c.contact_id for c in db.query(Conversation).filter(Conversation.whatsapp_number_id == n456.id).all()]
+    expected_chats = len([c for c in CHATS["acc_456"] if c["id"] in MESSAGES and not c.get("type") == "group" and c["id"] not in ("0@s.whatsapp.net",)])
+    db.query(_AR).filter(_AR.conversation_id.in_(ids)).delete(synchronize_session=False)
+    db.query(Message).filter(Message.conversation_id.in_(ids)).delete(synchronize_session=False)
+    db.query(Conversation).filter(Conversation.id.in_(ids)).delete(synchronize_session=False)
+    db.query(Contact).filter(Contact.id.in_(cids)).delete(synchronize_session=False)
+    n456.history_synced_at = _dt.now(_tz.utc)      # it still says 'already imported'
+    db.commit()
+    check(db.query(Conversation).filter(Conversation.whatsapp_number_id == n456.id).count() == 0, "(simulated) every chat of one number is gone")
+sync._chats_step(); wait_idle()
+with SessionLocal() as db:
+    back = db.query(Conversation).filter(Conversation.whatsapp_number_id == n456.id).count()
+    check(back >= 3 and back == len({m.conversation_id for m in db.query(Message).join(Conversation, Conversation.id == Message.conversation_id).filter(Conversation.whatsapp_number_id == n456.id)}),
+          "A number that says 'imported' but has no chats is imported again automatically", str(back))
+
+# 'Re-import chats': reads everything again from the service, deletes nothing, never duplicates
+with SessionLocal() as db:
+    msgs_before = db.query(Message).count(); convs_before = db.query(Conversation).count()
+check(client.post("/api/v1/numbers/refresh?full=true", headers=ADMIN).status_code == 403, "Only a Super Admin can re-import")
+r = client.post("/api/v1/numbers/refresh?full=true", headers=SA).json()
+wait_idle()
+for _ in range(80):
+    if not sync._work_lock.locked():
+        break
+    __import__("time").sleep(0.1)
+with SessionLocal() as db:
+    check(r.get("ok") and r.get("reimport") and db.query(Message).count() == msgs_before and db.query(Conversation).count() == convs_before,
+          "Re-import chats: everything is read again, nothing is removed and nothing is duplicated", f"{db.query(Message).count()} vs {msgs_before}; {db.query(Conversation).count()} vs {convs_before}")
+
+# --- following the Unipile guide: phone-sent messages, no duplicates, "Find Chats by User" ------
+oc = client.post("/api/v1/inbox/conversations/" + conv["id"] + "/messages", headers=ADMIN, json={"type": "text", "text": "Sent from the app"}).json()
+inbound("own_twin", "Sent from the app", sender="919876500001@s.whatsapp.net", is_sender=True)
+twins = [m for m in client.get(f"/api/v1/inbox/conversations/{conv['id']}", headers=ADMIN).json()["messages"] if m["text"] == "Sent from the app"]
+check(len(twins) == 1, "A message sent from this app is not shown twice when Unipile reports it under another id")
+fake.fixed_id = "FIXED_X"
+inbound("FIXED_X", "Phone first", sender="919876500001@s.whatsapp.net", is_sender=True)
+r = client.post("/api/v1/inbox/conversations/" + conv["id"] + "/messages", headers=ADMIN, json={"type": "text", "text": "Phone first"}).json()
+fake.fixed_id = None
+fx = [m for m in client.get(f"/api/v1/inbox/conversations/{conv['id']}", headers=ADMIN).json()["messages"] if m["text"] == "Phone first"]
+check(len(fx) == 1 and r["id"] == fx[0]["id"], "...nor when Unipile's notification arrives before the app has stored its own copy")
+inbound("own_new", "Hello, first contact from my phone", sender="919877001122@s.whatsapp.net", is_sender=True)
+newc = next((c for c in client.get("/api/v1/inbox/conversations", headers=ADMIN).json() if c["contact"]["phone"] == "+919877001122"), None)
+check(newc is not None and newc["unread_count"] == 0, "Writing to someone new from the phone creates their chat here (nothing unread)")
+inbound("m_back", "Hi! got your message", sender="919877001122@s.whatsapp.net")
+check(next(c for c in client.get("/api/v1/inbox/conversations", headers=ADMIN).json() if c["contact"]["phone"] == "+919877001122")["unread_count"] == 1, "...and their reply is threaded with it")
+
+svc = ws.get_whatsapp_service()
+fake.user_chats.clear(); n_get = len(fake.gets); n_call = len(fake.calls)
+res = svc.send_text("+919876543210", "+919800123456", "no chat yet")
+check(res.success and fake.gets[n_get:] == ["https://api.unipile.com/v2/acc_123/users/919800123456@s.whatsapp.net/chat"]
+      and fake.calls[-1]["url"] == "https://api.unipile.com/v2/acc_123/chats/send" and fake.calls[-1]["json"]["users_ids"] == "919800123456@s.whatsapp.net",
+      "Sending to someone with no stored chat asks 'Find Chats by User' first, then starts a chat with number@s.whatsapp.net")
+fake.user_chats["919800123456@s.whatsapp.net"] = "chat_found_77"
+res = svc.send_text("+919876543210", "+919800123456", "chat exists")
+check(res.success and fake.calls[-1]["url"] == "https://api.unipile.com/v2/acc_123/chats/chat_found_77/messages/send", "...and reuses the chat Unipile says already exists, whatever its id looks like")
+fake.user_chats.clear()
 
 # --- demo-data cleanup ------------------------------------------------------------
 from app.services.demo_cleanup import purge_demo_data  # noqa: E402
