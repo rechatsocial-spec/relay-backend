@@ -551,6 +551,46 @@ fast_forward()
 ar.process_due_runs()
 check(len(fake.calls) == n4, "Pausing the automation stops runs that are waiting")
 
+# --- messages that arrive only through the catch-up import still start automations ------------
+from datetime import datetime as _cdt, timezone as _ctz  # noqa: E402
+from app.models.contact import Contact  # noqa: E402
+client.patch(f"/api/v1/automations/{auto['id']}", headers=ADMIN, json={"status": "Running"})
+_fresh = _cdt.now(_ctz.utc).isoformat().replace("+00:00", "Z")
+CHATS["acc_123"][:0] = [
+    {"id": "919833333333@s.whatsapp.net", "name": "Catch Up", "user_id": "919833333333@s.whatsapp.net", "unread_count": 1},
+    {"id": "919844444444@s.whatsapp.net", "name": "Old History", "user_id": "919844444444@s.whatsapp.net", "unread_count": 1},
+]
+MESSAGES["919833333333@s.whatsapp.net"] = [_m("cu1", "hello there", _fresh)]
+MESSAGES["919844444444@s.whatsapp.net"] = [_m("cu2", "an old message", "2026-01-01T10:00:00.000Z")]
+with SessionLocal() as db:
+    _num = db.query(WhatsAppNumber).filter(WhatsAppNumber.unipile_account_id == "acc_123").first()
+    sync.sync_recent(db, _num)
+_n5 = len(fake.calls)
+ar.process_due_runs()
+check(len(fake.calls) == _n5 + 1 and fake.calls[-1]["json"]["text"] == "Hi Catch, welcome to Relay!"
+      and fake.calls[-1]["url"].endswith("/chats/919833333333@s.whatsapp.net/messages/send"),
+      "A fresh customer message found by the catch-up import gets the welcome message")
+with SessionLocal() as db:
+    check(db.query(AutomationRun).filter(AutomationRun.contact_id.in_([c.id for c in db.query(Contact).filter(Contact.phone.like("%9844444444"))])).count() == 0,
+          "An old message found by the catch-up import (history) starts nothing")
+    db.query(AutomationRun).delete()
+    for _cv in db.query(Conversation).filter(Conversation.provider_chat_id.in_(["919833333333@s.whatsapp.net", "919844444444@s.whatsapp.net"])).all():
+        _cid = _cv.contact_id
+        db.query(Message).filter(Message.conversation_id == _cv.id).delete(synchronize_session=False)
+        db.delete(_cv)
+        db.flush()
+        db.query(Contact).filter(Contact.id == _cid).delete(synchronize_session=False)
+    db.commit()
+del CHATS["acc_123"][:2]
+del MESSAGES["919833333333@s.whatsapp.net"], MESSAGES["919844444444@s.whatsapp.net"]
+client.patch(f"/api/v1/automations/{auto['id']}", headers=ADMIN, json={"status": "Paused"})
+
+# --- deleting an automation ---------------------------------------------------------------------
+_tmp = client.post("/api/v1/automations", headers=ADMIN, json={"name": "To delete", "trigger_type": "new_customer", "flow": flow}).json()
+check(client.delete(f"/api/v1/automations/{_tmp['id']}", headers=ADMIN).status_code == 204
+      and all(a["id"] != _tmp["id"] for a in client.get("/api/v1/automations", headers=ADMIN).json()), "An automation can be deleted")
+check(client.delete(f"/api/v1/automations/{_tmp['id']}", headers=ADMIN).status_code == 404, "Deleting it again is a 404")
+
 # --- ready-made automation templates ---------------------------------------------
 tl = client.get("/api/v1/automations/templates", headers=ADMIN).json()
 check(client.get("/api/v1/automations/templates").status_code == 401, "The template gallery needs a sign-in")
