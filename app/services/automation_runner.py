@@ -16,7 +16,8 @@ How the flow's nodes (a linear list, as saved by the builder) are executed:
   condition  "Customer replied?": true if the customer wrote after the trigger.
              Then only the following nodes whose `sub` is "YES" (or "NO") run,
              and the run ends.
-Opted-out contacts are never messaged.
+Every message step first waits a random 15-30 s (AUTOMATION_REPLY_DELAY_*, or the step's `replyDelay`)
+so automated replies don't arrive instantly. Opted-out contacts are never messaged.
 """
 import logging
 import random
@@ -29,6 +30,7 @@ from datetime import datetime, timedelta, timezone
 from sqlalchemy.orm import Session
 
 from app.core.automation_templates import DEFAULT_FLOW, default_message_for
+from app.core.config import settings
 from app.db.session import SessionLocal
 from app.models.automation import Automation, AutomationRun, AutomationStatus
 from app.models.contact import Contact
@@ -39,7 +41,7 @@ from app.services.whatsapp_service import get_whatsapp_service
 
 log = logging.getLogger("relay.automations")
 
-POLL_SECONDS = 5
+POLL_SECONDS = 1  # fine-grained: the random reply delays are only seconds long
 DEFAULT_DELAY_MINUTES = 60
 _UNITS = {"m": 1, "h": 60, "d": 1440}
 
@@ -80,10 +82,94 @@ def start_new_customer_automations(db: Session, number: WhatsAppNumber, contact:
     return len(autos)
 
 
+def _has_keyword(text: str, keywords: list[str]) -> bool:
+    low = (text or "").lower()
+    return any(re.search(rf"(?<!\w){re.escape(k.strip().lower())}(?!\w)", low) for k in keywords if k and k.strip())
+
+
+def start_keyword_automations(db: Session, number: WhatsAppNumber, contact: Contact, conv: Conversation, text: str) -> int:
+    """Queues a run per Running `keyword` automation whose keywords appear in this message (whole words,
+    any case). At most once per chat per automation per 24 hours, so a chatty customer is not answered twice.
+    Does not commit. Returns how many were queued."""
+    if not (text or "").strip():
+        return 0
+    autos = (
+        db.query(Automation)
+        .filter(Automation.admin_id == number.admin_id, Automation.trigger_type == "keyword", Automation.status == AutomationStatus.RUNNING)
+        .all()
+    )
+    now = utcnow()
+    queued = 0
+    for a in autos:
+        if not _has_keyword(text, (a.trigger_config or {}).get("keywords") or []):
+            continue
+        since = now - timedelta(hours=24)
+        recent = db.query(AutomationRun).filter(AutomationRun.automation_id == a.id, AutomationRun.conversation_id == conv.id,
+                                                AutomationRun.started_at >= since).first()
+        if recent:
+            continue
+        db.add(AutomationRun(automation_id=a.id, contact_id=contact.id, conversation_id=conv.id, whatsapp_number_id=number.id,
+                             next_index=1, run_at=now, started_at=now, status="pending"))
+        a.recipients = (a.recipients or 0) + 1
+        queued += 1
+    return queued
+
+
 def _handoff(db: Session, automation: Automation, conv: Conversation) -> None:
     conv.status = ConversationStatus.NEEDS_HUMAN
     db.add(Message(conversation_id=conv.id, sender=MessageSender.SYSTEM, type=MessageType.NOTE,
                    text=f"Automation \"{automation.name}\" handed this chat to a human", status=MessageStatus.SENT))
+
+
+_HANDOFF_WORDS = ("human", "transfer", "assign")
+
+
+def is_message_step(node: dict) -> bool:
+    return node.get("type") == "action" and not any(w in (node.get("label") or "").lower() for w in _HANDOFF_WORDS)
+
+
+def reply_delay(node: dict) -> tuple[float, float]:
+    """(min, max) seconds to wait before a message step is sent: the step's `replyDelay`, else the global default."""
+    lo, hi = float(settings.AUTOMATION_REPLY_DELAY_MIN), float(settings.AUTOMATION_REPLY_DELAY_MAX)
+    custom = node.get("replyDelay")
+    if isinstance(custom, dict):
+        try:
+            lo, hi = float(custom.get("min", lo)), float(custom.get("max", hi))
+        except (TypeError, ValueError):
+            pass
+    lo = max(0.0, min(lo, 3600.0))
+    return lo, max(lo, min(hi, 3600.0))
+
+
+def _wait_first(run: AutomationRun, idx: int, node: dict) -> bool:
+    """Before a message step: schedule a random 'typing' wait. True = wait scheduled, the run comes back later to send."""
+    if not is_message_step(node) or run.jitter_done == idx:
+        return False
+    lo, hi = reply_delay(node)
+    if hi <= 0:
+        return False
+    run.jitter_done = idx
+    # counted from the moment this step became due (the customer's message / the end of the previous wait),
+    # not from when the poller got to it, so the reply really lands 15-30 s after
+    due = _aware(run.run_at) or utcnow()
+    run.run_at = due + timedelta(seconds=random.uniform(lo, hi))
+    return True
+
+
+def _run_branch(db: Session, automation: Automation, run: AutomationRun, nodes: list, contact: Contact,
+                conv: Conversation, number: WhatsAppNumber) -> None:
+    """The steps of the chosen YES/NO branch, one at a time (each message waits its own random time)."""
+    queue = list(run.branch_queue or [])
+    while queue:
+        j = queue[0]
+        node = nodes[j] if j < len(nodes) and isinstance(nodes[j], dict) else {}
+        if _wait_first(run, j, node):
+            run.branch_queue = queue
+            return
+        _do_action(db, automation, run, node, contact, conv, number)
+        queue.pop(0)
+    run.branch_queue = None
+    run.status = "done"
 
 
 def _do_action(db: Session, automation: Automation, run: AutomationRun, node: dict,
@@ -115,6 +201,9 @@ def _advance(db: Session, run: AutomationRun) -> None:
         return
 
     nodes = (automation.flow or {}).get("nodes") or DEFAULT_FLOW["nodes"]  # nothing saved: the built-in flow
+    if run.branch_queue:  # in the middle of a YES/NO branch
+        _run_branch(db, automation, run, nodes, contact, conv, number)
+        return
     i = run.next_index
     while i < len(nodes):
         node = nodes[i] if isinstance(nodes[i], dict) else {}
@@ -129,12 +218,14 @@ def _advance(db: Session, run: AutomationRun) -> None:
             if replied:
                 automation.replies = (automation.replies or 0) + 1
             branch = "YES" if replied else "NO"
-            for n in nodes[i + 1:]:
-                if isinstance(n, dict) and n.get("type") == "action" and (n.get("sub") or "").upper() == branch:
-                    _do_action(db, automation, run, n, contact, conv, number)
-            run.status = "done"
+            run.branch_queue = [j for j in range(i + 1, len(nodes)) if isinstance(nodes[j], dict) and nodes[j].get("type") == "action"
+                                and (nodes[j].get("sub") or "").upper() == branch]
+            _run_branch(db, automation, run, nodes, contact, conv, number)
             return
         if kind == "action":
+            if _wait_first(run, i, node):
+                run.next_index = i  # come back to this step once the wait is over
+                return
             _do_action(db, automation, run, node, contact, conv, number)
         i += 1
     run.status = "done"

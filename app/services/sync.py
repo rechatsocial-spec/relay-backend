@@ -26,11 +26,12 @@ from sqlalchemy.orm import Session
 
 from app.core.config import settings
 from app.db.session import SessionLocal
+from app.models.automation import AutomationRun
 from app.models.contact import Contact, ContactStatus
 from app.models.conversation import Conversation, Message, MessageSender, MessageStatus, MessageType
 from app.models.user import Role, User
 from app.models.whatsapp_number import NumberStatus, WhatsAppNumber
-from app.services.chat_utils import attachment_fields, digits_to_phone, find_contact, phone_from_user_id
+from app.services.chat_utils import attachment_fields, digits_to_phone, find_contact, is_person_chat, lid_placeholder, phone_from_user_id
 from app.services.connection_status import _MAP
 from app.services.messaging import get_or_create_conversation, utcnow
 
@@ -164,25 +165,40 @@ def sync_accounts(db: Session) -> list[WhatsAppNumber]:
 
 # ───────────────────────────── chats -> contacts, conversations, messages
 
-def _phone_for_chat(account_id: str, chat: dict) -> str | None:
-    user_id = chat.get("user_id") or chat.get("id") or ""
-    phone = phone_from_user_id(user_id) or phone_from_user_id(chat.get("id") or "")
-    if phone:
-        return phone
-    try:  # an @lid id: the phone number is on the user's profile
-        return digits_to_phone(_get(f"/{account_id}/users/{user_id}").get("public_identifier"))
+def _profile(account_id: str, user_id: str) -> dict:
+    """Best-effort profile of a person (name and, when WhatsApp shares it, the phone as public_identifier)."""
+    try:
+        return _get(f"/{account_id}/users/{user_id}") or {}
     except Exception:
-        return None
+        return {}
+
+
+def purge_system_chats(db: Session) -> int:
+    """Removes chats that are not customers (WhatsApp's own '+0' chat, groups, status...) imported by an earlier version."""
+    removed = 0
+    for conv in db.query(Conversation).filter(Conversation.provider_chat_id.isnot(None)).all():
+        if is_person_chat(conv.provider_chat_id):
+            continue
+        db.query(AutomationRun).filter(AutomationRun.conversation_id == conv.id).delete(synchronize_session=False)
+        db.query(Message).filter(Message.conversation_id == conv.id).delete(synchronize_session=False)
+        contact_id = conv.contact_id
+        db.delete(conv)
+        db.flush()
+        if not db.query(Conversation).filter(Conversation.contact_id == contact_id).first():
+            db.query(AutomationRun).filter(AutomationRun.contact_id == contact_id).delete(synchronize_session=False)
+            db.query(Contact).filter(Contact.id == contact_id).delete(synchronize_session=False)
+        removed += 1
+    if removed:
+        db.commit()
+        log.warning("Removed %s non-customer chats (WhatsApp system chat, groups...)", removed)
+    return removed
 
 
 def _import_chat(db: Session, number: WhatsAppNumber, chat: dict) -> int:
     """Imports one chat. Returns how many messages were new."""
     chat_id = chat.get("id")
     acc = number.unipile_account_id
-    if not chat_id:
-        return 0
-    phone = _phone_for_chat(acc, chat)
-    if not phone:
+    if not chat_id or not is_person_chat(chat_id):
         return 0
     messages = (_get(f"/{acc}/chats/{chat_id}/messages", {"limit": MESSAGES_PER_CHAT}).get("data")) or []
     items = []
@@ -197,19 +213,29 @@ def _import_chat(db: Session, number: WhatsAppNumber, chat: dict) -> int:
         return 0
     items.sort(key=lambda x: x[0])
 
-    contact = find_contact(db, number, phone)
-    if contact is None:
-        contact = Contact(
-            name=(chat.get("name") or phone)[:120], phone=phone, whatsapp_number_id=number.id, admin_id=number.admin_id,
-            status=ContactStatus.REPLIED if any(not m.get("is_sender") for _, m in items) else ContactStatus.CONTACTED,
-            tags=["WhatsApp"], source="Existing chat",
-        )
-        db.add(contact)
-        db.flush()
-
+    # whose chat is this? An existing conversation knows; otherwise the phone (or, if WhatsApp hides it, the chat's own id)
     conv = db.query(Conversation).filter(Conversation.provider_chat_id == chat_id, Conversation.whatsapp_number_id == number.id).first()
     is_new_conv = conv is None
-    if is_new_conv:
+    if conv is not None:
+        contact = db.get(Contact, conv.contact_id)
+    else:
+        user_id = chat.get("user_id") or chat_id
+        phone = phone_from_user_id(user_id) or phone_from_user_id(chat_id)
+        profile = {}
+        if not phone:  # a hidden-number (@lid) person: the phone may be on the profile
+            profile = _profile(acc, user_id)
+            phone = digits_to_phone(profile.get("public_identifier"))
+        key = phone or lid_placeholder(user_id)
+        contact = find_contact(db, number, key)
+        if contact is None:
+            contact = Contact(
+                name=(chat.get("name") or profile.get("display_name") or profile.get("first_name") or phone or "WhatsApp contact")[:120],
+                phone=key, whatsapp_number_id=number.id, admin_id=number.admin_id,
+                status=ContactStatus.REPLIED if any(not m.get("is_sender") for _, m in items) else ContactStatus.CONTACTED,
+                tags=["WhatsApp"], source="Existing chat",
+            )
+            db.add(contact)
+            db.flush()
         conv = get_or_create_conversation(db, contact, number)
         is_new_conv = not conv.messages
         conv.provider_chat_id = chat_id
@@ -353,6 +379,11 @@ def _chats_step() -> None:
     STATE["history_importing"] = True
     db = SessionLocal()
     try:
+        try:
+            purge_system_chats(db)
+        except Exception:
+            db.rollback()
+            log.exception("Could not remove non-customer chats")
         for n in db.query(WhatsAppNumber).filter(WhatsAppNumber.unipile_account_id.isnot(None)).all():
             try:
                 if n.history_synced_at is None:

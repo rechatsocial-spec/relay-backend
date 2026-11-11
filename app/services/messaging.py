@@ -68,9 +68,9 @@ def send_message(
     if content_sid:
         result = whatsapp.send_template(number.phone, contact.phone, content_sid, content_variables)
     elif msg_type == MessageType.TEXT:
-        result = whatsapp.send_text(number.phone, contact.phone, text or "")
+        result = whatsapp.send_text(number.phone, contact.phone, text or "", chat_id=conversation.provider_chat_id)
     elif media_url:
-        result = whatsapp.send_media(number.phone, contact.phone, media_url, caption=text)
+        result = whatsapp.send_media(number.phone, contact.phone, media_url, caption=text, chat_id=conversation.provider_chat_id)
     else:
         result = SendResult(False, None, error="A media URL is required for this message type")
 
@@ -98,7 +98,8 @@ def send_attachment_message(
 ) -> Message:
     """Sends a file through the provider and records it. Does not commit."""
     result = whatsapp.send_attachment(number.phone, contact.phone, data, content_type, filename,
-                                      caption=caption or None, voice_note=voice_note, duration=duration)
+                                      caption=caption or None, voice_note=voice_note, duration=duration,
+                                      chat_id=conversation.provider_chat_id)
     if content_type.startswith("image/"):
         mtype = MessageType.IMAGE
     elif content_type.startswith("video/"):

@@ -32,6 +32,11 @@ class Settings(BaseSettings):
     # Used to show the webhook address in the app.
     PUBLIC_BASE_URL: str = ""
 
+    # Automated replies wait a random time (seconds) before they are sent, so they don't arrive instantly.
+    # A message step can override it with `replyDelay: {min, max}`; 0 / 0 sends at once.
+    AUTOMATION_REPLY_DELAY_MIN: float = 15
+    AUTOMATION_REPLY_DELAY_MAX: float = 30
+
     # Largest file that can be sent from the inbox.
     MAX_UPLOAD_MB: int = 16
 

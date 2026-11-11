@@ -19,5 +19,6 @@ def whatsapp_status(user: User = Depends(get_current_user)):
         "public_base_url": base or None,
         "inbound_webhook_url": f"{base}{settings.API_V1_PREFIX}/whatsapp/webhook" if base else None,
         "send_interval_seconds": settings.CAMPAIGN_SEND_INTERVAL_SECONDS,
+        "reply_delay": {"min": settings.AUTOMATION_REPLY_DELAY_MIN, "max": settings.AUTOMATION_REPLY_DELAY_MAX},
         "sync": {**STATE, "error": STATE["error"] if user.role == Role.SUPER_ADMIN else None},
     }

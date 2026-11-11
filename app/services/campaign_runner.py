@@ -41,7 +41,7 @@ def resolve_audience(db: Session, number: WhatsAppNumber, audience_filter: dict 
             q = q.filter(Contact.status == ContactStatus(f["status"]))
         except ValueError:
             return [], 0
-    contacts = q.order_by(Contact.created_at).all()
+    contacts = [c for c in q.order_by(Contact.created_at).all() if not (c.phone or "").startswith("lid:")]  # hidden-number people can only be answered in their chat
     if f.get("tag"):
         tag = f["tag"].strip().lower()
         contacts = [c for c in contacts if any(t.lower() == tag for t in (c.tags or []))]

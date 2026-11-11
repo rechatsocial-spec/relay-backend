@@ -8,7 +8,7 @@ from app.db.session import get_db
 from app.models.user import User
 from app.models.automation import Automation
 from app.models.activity_log import ActivityLog
-from app.core.automation_templates import TEMPLATES, flow_of, get_template, steps_of
+from app.core.automation_templates import TEMPLATES, flow_of, get_template, starts_when, steps_of, trigger_of
 from app.schemas.automation import (
     AutomationCreate, AutomationUpdate, AutomationOut, AutomationFromTemplate, AutomationTemplateOut,
 )
@@ -27,7 +27,7 @@ def list_automations(db: Session = Depends(get_db), scope: uuid.UUID | None = De
 @router.get("/templates", response_model=list[AutomationTemplateOut])
 def list_templates(user: User = Depends(get_current_user)):
     """Ready-made automations anyone can start from."""
-    return [AutomationTemplateOut(id=t["id"], name=t["name"], description=t["description"], steps=steps_of(t)) for t in TEMPLATES]
+    return [AutomationTemplateOut(id=t["id"], name=t["name"], description=t["description"], starts_when=starts_when(t), steps=steps_of(t)) for t in TEMPLATES]
 
 
 @router.post("/from-template", response_model=AutomationOut)
@@ -37,7 +37,8 @@ def create_from_template(payload: AutomationFromTemplate, db: Session = Depends(
     if not template:
         raise HTTPException(404, "Template not found")
     name = (payload.name or "").strip() or template["name"]
-    automation = Automation(name=name[:160], trigger_type="new_customer", flow=flow_of(template), admin_id=scope or user.id)
+    ttype, tconfig = trigger_of(template)
+    automation = Automation(name=name[:160], trigger_type=ttype, trigger_config=tconfig, flow=flow_of(template), admin_id=scope or user.id)
     db.add(automation)
     db.add(ActivityLog(actor_id=user.id, type="automation", message=f"{user.name} created automation \"{automation.name}\" from the \"{template['name']}\" template"))
     db.commit()

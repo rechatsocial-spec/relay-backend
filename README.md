@@ -159,6 +159,36 @@ A configured `UNIPILE_API_KEY` always means live mode, even if `WHATSAPP_MOCK=tr
 If your numbers don't appear: Super Admin → WhatsApp Numbers → **Refresh** shows the exact error
 (wrong key, key not allowed to list accounts → use a Service Key or `UNIPILE_ACCOUNT_IDS`, ...).
 
+### Message templates and webhook-driven automations
+
+**Templates** are your own saved messages (`/templates`: name + text, `{{name}}` = the customer's first name). They
+are sent as ordinary WhatsApp messages, so no provider approval is involved. Pick one from the chat box, from a
+campaign's message, or into any automation message step.
+
+**Automations are started by the incoming-message webhook.** Every `message.new` can start a run:
+`new_customer` (first message from someone new) or `keyword` (the message contains one of the automation's
+keywords: whole words, any capitals, at most once per chat per automation per 24 h; `trigger_config.keywords`).
+`GET /automations/templates` lists ready-made flows, including keyword auto-replies and "hand over when they ask
+for a person". The standard flow (welcome, wait 2 hours, replied? yes: hand over, no: follow-up) comes first.
+Each message step shows its text on the flow with **Write message** and **+ Add variant**.
+
+### Which chats are imported, and people WhatsApp hides
+
+Only one-to-one chats with people are customers. WhatsApp's own system chat (`0@s.whatsapp.net`, which showed up as
+"WhatsApp Business +0"), groups, status and newsletters are never imported, and any left behind by an older version
+are removed automatically. WhatsApp can also identify a person only by a hidden id (`...@lid`) without sharing a phone
+number: such a chat is still imported and shown ("Phone hidden by WhatsApp"), keyed internally as `lid:<id>`.
+Replies always go to the chat's own id as Unipile returned it, so they reach hidden-number people too.
+Campaigns skip those contacts (there is no number to send to); they can only be answered in their chat.
+
+### Automated replies are never instant
+
+Every message step of an automation waits a random 15-30 seconds before it is sent (set `AUTOMATION_REPLY_DELAY_MIN` /
+`_MAX`, or per step in the builder: "Wait before sending", `replyDelay: {min, max}`; 0 and 0 = instant). The wait is
+counted from the customer's message (or from the end of the previous wait), is stored with the run so it survives
+restarts, and also applies to the follow-up inside a YES/NO branch and to keyword replies. A hand-over to a human
+waits behind the message before it.
+
 ### Attachments and voice notes
 
 The inbox composer sends real files: the paperclip / image / video buttons open the device's file picker

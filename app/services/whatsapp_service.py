@@ -40,15 +40,16 @@ class WhatsAppServiceInterface(ABC):
     name = "base"
 
     @abstractmethod
-    def send_text(self, from_number: str, to: str, text: str) -> SendResult: ...
+    def send_text(self, from_number: str, to: str, text: str, chat_id: str | None = None) -> SendResult: ...
 
     @abstractmethod
-    def send_media(self, from_number: str, to: str, media_url: str, caption: str | None = None) -> SendResult:
+    def send_media(self, from_number: str, to: str, media_url: str, caption: str | None = None, chat_id: str | None = None) -> SendResult:
         """Image / video / voice note / sticker / document — WhatsApp decides by the file's type."""
 
     @abstractmethod
     def send_attachment(self, from_number: str, to: str, data: bytes, content_type: str, filename: str,
-                        caption: str | None = None, voice_note: bool = False, duration: int | None = None) -> SendResult:
+                        caption: str | None = None, voice_note: bool = False, duration: int | None = None,
+                        chat_id: str | None = None) -> SendResult:
         """A file picked or recorded in the inbox: photo, video, document or voice note."""
 
     @abstractmethod
@@ -64,13 +65,13 @@ class MockWhatsAppService(WhatsAppServiceInterface):
     def _mock(self) -> SendResult:
         return SendResult(success=True, provider_message_id=f"mock_{uuid.uuid4().hex[:12]}")
 
-    def send_text(self, from_number, to, text):
+    def send_text(self, from_number, to, text, chat_id=None):
         return self._mock()
 
-    def send_media(self, from_number, to, media_url, caption=None):
+    def send_media(self, from_number, to, media_url, caption=None, chat_id=None):
         return self._mock()
 
-    def send_attachment(self, from_number, to, data, content_type, filename, caption=None, voice_note=False, duration=None):
+    def send_attachment(self, from_number, to, data, content_type, filename, caption=None, voice_note=False, duration=None, chat_id=None):
         return self._mock()
 
     def send_template(self, from_number, to, template_id, variables=None):
@@ -145,13 +146,13 @@ class UnipileWhatsAppService(WhatsAppServiceInterface):
             db.close()
         return None
 
-    def _send(self, from_number: str, to: str, text: str, attachments: list | None = None) -> SendResult:
+    def _send(self, from_number: str, to: str, text: str, attachments: list | None = None, chat_id: str | None = None) -> SendResult:
         account_id = self._account_id_for(from_number)
         if not account_id:
             return SendResult(False, None, error=f"{from_number} is not linked yet — link the number first",
                               error_code="unipile_not_linked")
         jid = f"{to_e164(to).lstrip('+')}@s.whatsapp.net"
-        chat_id = self._chat_id_for(account_id, to) or jid
+        chat_id = chat_id or self._chat_id_for(account_id, to) or jid  # the chat's own id when we know it (@lid people)
         base = f"{settings.UNIPILE_BASE_URL.rstrip('/')}/{account_id}"
         headers = {"X-API-KEY": settings.UNIPILE_API_KEY, "accept": "application/json"}
         try:
@@ -180,10 +181,10 @@ class UnipileWhatsAppService(WhatsAppServiceInterface):
         log.warning("Unipile send failed (%s): %s", r.status_code, err)
         return SendResult(False, None, error=str(err)[:300], error_code=str(r.status_code))
 
-    def send_text(self, from_number, to, text):
-        return self._send(from_number, to, text)
+    def send_text(self, from_number, to, text, chat_id=None):
+        return self._send(from_number, to, text, chat_id=chat_id)
 
-    def send_media(self, from_number, to, media_url, caption=None):
+    def send_media(self, from_number, to, media_url, caption=None, chat_id=None):
         import base64
         import mimetypes
         from urllib.parse import urlparse
@@ -196,9 +197,9 @@ class UnipileWhatsAppService(WhatsAppServiceInterface):
         filename = urlparse(media_url).path.rsplit("/", 1)[-1] or "file"
         content_type = (dl.headers.get("content-type") or "").split(";")[0] or mimetypes.guess_type(filename)[0] or "application/octet-stream"
         attachment = {"content": base64.b64encode(dl.content).decode(), "content_type": content_type, "filename": filename}
-        return self._send(from_number, to, caption or "", [attachment])
+        return self._send(from_number, to, caption or "", [attachment], chat_id=chat_id)
 
-    def send_attachment(self, from_number, to, data, content_type, filename, caption=None, voice_note=False, duration=None):
+    def send_attachment(self, from_number, to, data, content_type, filename, caption=None, voice_note=False, duration=None, chat_id=None):
         import base64
 
         attachment = {"content": base64.b64encode(data).decode(), "content_type": content_type, "filename": filename}
@@ -206,7 +207,7 @@ class UnipileWhatsAppService(WhatsAppServiceInterface):
             attachment["voice_note"] = True  # plays as a voice message
         if duration:
             attachment["metadata"] = {"duration": int(duration)}
-        return self._send(from_number, to, caption or "", [attachment])
+        return self._send(from_number, to, caption or "", [attachment], chat_id=chat_id)
 
     def send_template(self, from_number, to, template_id, variables=None):
         return SendResult(

@@ -23,6 +23,10 @@ def _handoff(node_id="handoff", sub="Action"):
     return {"id": node_id, "type": "action", "label": "Transfer to human", "sub": sub, "icon": "UserCog"}
 
 
+def _keyword_trigger(words):
+    return {"id": "trigger", "type": "trigger", "label": "Message contains keywords", "sub": ", ".join(words), "icon": "Zap"}
+
+
 def _wait(label):
     return {"id": "delay", "type": "delay", "label": label, "sub": "Delay", "icon": "Clock"}
 
@@ -78,6 +82,46 @@ TEMPLATES = [
         ]},
     },
 ]
+
+
+TEMPLATES += [
+    {
+        "id": "keyword_reply",
+        "name": "Auto-reply to keywords",
+        "description": "Answers instantly when a customer's message contains a keyword such as price or catalogue. Edit the keywords and the reply.",
+        "trigger_type": "keyword",
+        "trigger_config": {"keywords": ["price", "pricing", "cost", "catalogue"]},
+        "flow": {"nodes": [
+            _keyword_trigger(["price", "pricing", "cost", "catalogue"]),
+            _msg("reply", "Send reply message", "Hi {{name}}, thanks for asking! Our prices start at ... Reply here and we will send you the full details."),
+        ]},
+    },
+    {
+        "id": "keyword_human",
+        "name": "Hand over when they ask for a person",
+        "description": "When a message contains agent, human, help or support: confirm and flag the chat for your team.",
+        "trigger_type": "keyword",
+        "trigger_config": {"keywords": ["agent", "human", "help", "support"]},
+        "flow": {"nodes": [
+            _keyword_trigger(["agent", "human", "help", "support"]),
+            _msg("ack", "Send acknowledgement message", "Of course {{name}}, I am getting a member of our team for you now."),
+            _handoff(),
+        ]},
+    },
+]
+
+
+TEMPLATES.sort(key=lambda t: t["id"] != "welcome_followup")  # the standard flow comes first
+
+
+def trigger_of(template: dict) -> tuple[str, dict | None]:
+    return template.get("trigger_type", "new_customer"), copy.deepcopy(template.get("trigger_config"))
+
+
+def starts_when(template: dict) -> str:
+    if template.get("trigger_type") == "keyword":
+        return "A message contains: " + ", ".join(template["trigger_config"]["keywords"])
+    return "A new customer writes to you"
 
 
 def get_template(template_id: str) -> dict | None:

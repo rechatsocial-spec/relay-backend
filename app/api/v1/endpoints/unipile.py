@@ -27,10 +27,10 @@ from app.db.session import get_db
 from app.models.activity_log import ActivityLog
 from app.models.campaign import Campaign
 from app.models.contact import Contact, ContactStatus
-from app.models.conversation import ConversationStatus, Message, MessageSender, MessageStatus, MessageType
+from app.models.conversation import Conversation, ConversationStatus, Message, MessageSender, MessageStatus, MessageType
 from app.models.whatsapp_number import NumberStatus, WhatsAppNumber
-from app.services.automation_runner import start_new_customer_automations
-from app.services.chat_utils import attachment_fields, digits_to_phone, find_contact, phone_from_user_id
+from app.services.automation_runner import start_keyword_automations, start_new_customer_automations
+from app.services.chat_utils import attachment_fields, digits_to_phone, find_contact, is_person_chat, lid_placeholder, phone_from_user_id
 from app.services.messaging import get_or_create_conversation, utcnow
 
 log = logging.getLogger("relay.unipile")
@@ -107,29 +107,28 @@ def _handle_message_new(db: Session, number: WhatsAppNumber, m: dict) -> None:
     if mid and db.query(Message).filter(Message.provider_message_id == mid).first():
         return  # webhook retry
     chat_id = m.get("chat_id") or ""
-    if chat_id.endswith("@g.us"):
-        return  # group chats aren't 1:1 CRM conversations
-    sender_id = m.get("sender_id") or ""
-    phone = _resolve_phone(number, m)
-    if not phone:
-        db.add(ActivityLog(type="whatsapp_number", message=f"Ignored message from {sender_id} — the phone number was not available for it"))
-        db.commit()
-        return
-
-    name = ((m.get("sender") or {}).get("display_name") or phone)[:120]
-    contact = find_contact(db, number, phone)
-    is_new_customer = contact is None
-    if not contact:
-        contact = Contact(
-            name=name, phone=phone, whatsapp_number_id=number.id, admin_id=number.admin_id,
-            status=ContactStatus.NEW, tags=["WhatsApp inbound"], source="Inbound WhatsApp",
-        )
-        db.add(contact)
-        db.flush()
-
-    conv = get_or_create_conversation(db, contact, number)
-    if chat_id:
-        conv.provider_chat_id = chat_id  # reply to the id Unipile uses, unchanged (may be @lid)
+    if not is_person_chat(chat_id):
+        return  # groups, status, newsletters, WhatsApp's own system chat: not CRM customers
+    sender_id = m.get("sender_id") or chat_id
+    conv = db.query(Conversation).filter(Conversation.provider_chat_id == chat_id, Conversation.whatsapp_number_id == number.id).first()
+    is_new_customer = False
+    if conv is not None:
+        contact = db.get(Contact, conv.contact_id)
+    else:
+        phone = _resolve_phone(number, m)  # None if WhatsApp hides it: the chat id then stands in for it
+        key = phone or lid_placeholder(sender_id)
+        name = ((m.get("sender") or {}).get("display_name") or phone or "WhatsApp contact")[:120]
+        contact = find_contact(db, number, key)
+        is_new_customer = contact is None
+        if not contact:
+            contact = Contact(
+                name=name, phone=key, whatsapp_number_id=number.id, admin_id=number.admin_id,
+                status=ContactStatus.NEW, tags=["WhatsApp inbound"], source="Inbound WhatsApp",
+            )
+            db.add(contact)
+            db.flush()
+        conv = get_or_create_conversation(db, contact, number)
+    conv.provider_chat_id = chat_id  # reply to the id Unipile uses, unchanged (may be @lid)
     previous = (
         db.query(Message).filter(Message.conversation_id == conv.id)
         .order_by(Message.created_at.desc()).first()
@@ -172,6 +171,8 @@ def _handle_message_new(db: Session, number: WhatsAppNumber, m: dict) -> None:
     number.last_activity_at = now
     if is_new_customer and not contact.opted_out:
         start_new_customer_automations(db, number, contact, conv)  # sent by the poller within seconds
+    if not contact.opted_out and keyword not in STOP_WORDS:
+        start_keyword_automations(db, number, contact, conv, body or "")  # the message may contain a trigger keyword
     db.commit()
 
 

@@ -27,7 +27,8 @@ class Automation(Base):
     # Flow is stored as JSON: a list of {type: trigger|action|condition, ...}
     # nodes plus edges. The frontend's canvas reads/writes this shape directly.
     flow: Mapped[dict] = mapped_column(JSON, default=dict)
-    trigger_type: Mapped[str] = mapped_column(String(60), default="new_customer")
+    trigger_type: Mapped[str] = mapped_column(String(60), default="new_customer")  # new_customer | keyword
+    trigger_config: Mapped[dict | None] = mapped_column(JSON, nullable=True)  # keyword: {"keywords": ["price", ...]}
 
     status: Mapped[AutomationStatus] = mapped_column(Enum(AutomationStatus, name="automation_status"), default=AutomationStatus.SCHEDULED)
     recipients: Mapped[int] = mapped_column(Integer, default=0)
@@ -51,3 +52,5 @@ class AutomationRun(Base):
     run_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
     started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     status: Mapped[str] = mapped_column(String(20), default="pending", index=True)  # pending | done | failed
+    jitter_done: Mapped[int | None] = mapped_column(Integer, nullable=True)  # step whose random 'typing' wait is over
+    branch_queue: Mapped[list | None] = mapped_column(JSON, nullable=True)  # steps of the chosen YES/NO branch still to run

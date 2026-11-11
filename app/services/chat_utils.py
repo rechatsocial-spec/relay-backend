@@ -40,7 +40,7 @@ def phone_from_user_id(user_id: str) -> str | None:
     if not user_id.endswith("@s.whatsapp.net"):
         return None
     digits = re.sub(r"\D", "", user_id.split("@", 1)[0])
-    return f"+{digits}" if digits else None
+    return f"+{digits}" if len(digits) >= 7 else None  # "0@s.whatsapp.net" is WhatsApp itself
 
 
 def attachment_fields(att: dict | None, message_id) -> dict:
@@ -71,3 +71,19 @@ def attachment_fields(att: dict | None, message_id) -> dict:
         "type": mtype, "media_name": (att.get("filename") or None), "media_type": mime, "duration_seconds": secs,
         "media_source": url, "media_url": proxy_url(message_id) if url else None,
     }
+
+
+def is_person_chat(chat_id: str | None) -> bool:
+    """A 1:1 chat with a person. Groups, status, newsletters and WhatsApp's own system chat are not customers."""
+    low = (chat_id or "").lower()
+    if low.endswith("@lid"):
+        return True
+    if low.endswith("@s.whatsapp.net"):
+        return len(re.sub(r"\D", "", low.split("@", 1)[0])) >= 7
+    return False
+
+
+def lid_placeholder(user_id: str | None) -> str:
+    """Stand-in 'phone' for a person WhatsApp identifies only by a hidden id (@lid). Never dialled."""
+    local = re.sub(r"[^0-9A-Za-z]", "", (user_id or "").split("@", 1)[0]) or "unknown"
+    return f"lid:{local}"[:30]

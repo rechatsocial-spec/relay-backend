@@ -20,6 +20,7 @@ os.environ.update(
     DATABASE_URL=f"sqlite:///{db_file}", SECRET_KEY="test", WHATSAPP_MOCK="false",
     UNIPILE_API_KEY="key_test", UNIPILE_WEBHOOK_SECRET=SECRET,
     PUBLIC_BASE_URL="https://crm.example.com", CAMPAIGN_SEND_INTERVAL_SECONDS="0",
+    AUTOMATION_REPLY_DELAY_MIN="0", AUTOMATION_REPLY_DELAY_MAX="0",
     BOOTSTRAP_ADMIN_EMAIL="Boss@Example.com", BOOTSTRAP_ADMIN_PASSWORD="boot-pass-1",
 )
 
@@ -35,7 +36,7 @@ import app.seed as seed  # noqa: E402
 import app.services.whatsapp_service as ws  # noqa: E402
 from app.db.session import SessionLocal  # noqa: E402
 from app.main import app  # noqa: E402
-from app.models.conversation import Message  # noqa: E402
+from app.models.conversation import Message, MessageSender, MessageStatus, MessageType  # noqa: E402
 from app.models.whatsapp_number import WhatsAppNumber  # noqa: E402
 
 
@@ -75,6 +76,8 @@ CHATS = {
         {"id": "919811111111@s.whatsapp.net", "name": "Old Friend", "user_id": "919811111111@s.whatsapp.net", "unread_count": 2},
         {"id": "555777@lid", "name": "Lid Chat", "user_id": "555777@lid", "unread_count": 0},
         {"id": "nophone@lid", "name": "No Phone", "user_id": "nophone@lid", "unread_count": 0},
+        {"id": "0@s.whatsapp.net", "name": "WhatsApp Business", "user_id": "0@s.whatsapp.net", "unread_count": 0},
+        {"id": "120363111@g.us", "name": "Family group", "user_id": None, "unread_count": 5},
     ],
     "acc_456": [{"id": "919822222222@s.whatsapp.net", "name": "Second Number Customer", "user_id": "919822222222@s.whatsapp.net", "unread_count": 0}],
 }
@@ -88,6 +91,8 @@ MESSAGES = {  # newest first, like the real API
     ],
     "555777@lid": [_m("l1", "Hi from a hidden-number contact", "2026-11-10T08:00:00.000Z")],
     "nophone@lid": [_m("n1", "who am i", "2026-11-10T07:00:00.000Z")],
+    "0@s.whatsapp.net": [_m("sys1", "Welcome to WhatsApp Business", "2026-11-08T01:18:00.000Z")],
+    "120363111@g.us": [_m("grp1", "group chatter", "2026-11-10T06:00:00.000Z")],
     "919822222222@s.whatsapp.net": [_m("s1", "Hello second number", "2026-11-10T11:00:00.000Z")],
 }
 USERS = {"555777@lid": "+91 98111 00099"}
@@ -126,10 +131,10 @@ from app.bootstrap import ensure_bootstrap_admin  # noqa: E402
 passed = failed = 0
 
 
-def check(cond, label):
+def check(cond, label, extra=""):
     global passed, failed
     passed, failed = passed + bool(cond), failed + (not cond)
-    print(("[OK] " if cond else "[FAIL] ") + label)
+    print(("[OK] " if cond else "[FAIL] ") + label + (f"   -> {extra}" if (extra and not cond) else ""))
 
 
 def login(email):
@@ -187,13 +192,16 @@ convs = client.get("/api/v1/inbox/conversations", headers=SA).json()
 byphone = {c["contact"]["phone"]: c for c in convs}
 check("+919811111111" in byphone and "+919822222222" in byphone, "Existing chats of BOTH numbers appear in one unified inbox")
 check("+919811100099" in byphone and byphone["+919811100099"]["contact"]["name"] == "Lid Chat", "A hidden-number (@lid) chat is resolved through the profile")
-check(not any(c["contact"]["name"] == "No Phone" for c in convs), "A chat whose phone can't be resolved is skipped")
+nop = next((c for c in convs if c["contact"]["name"] == "No Phone"), None)
+check(nop and nop["contact"]["phone"] == "lid:nophone", "A chat whose phone WhatsApp hides is still imported, keyed by its own chat id")
+check(not any(c["contact"]["name"] in ("WhatsApp Business", "Family group") or c["contact"]["phone"] in ("+0", "lid:0") for c in convs),
+      "WhatsApp's own system chat ('+0') and groups are not imported as customers")
 check({byphone["+919811111111"]["whatsapp_number_phone"], byphone["+919822222222"]["whatsapp_number_phone"]} == {"+919876543210", "+919123456789"}
       and byphone["+919822222222"]["whatsapp_number_name"], "Each conversation says which number it belongs to")
 only = client.get("/api/v1/inbox/conversations", headers=SA, params={"number_id": num2["id"]}).json()
 check(only and all(c["whatsapp_number_id"] == num2["id"] for c in only) and len(only) < len(convs), "Filtering by number shows only that number's chats")
 stats = next(n for n in client.get("/api/v1/numbers", headers=SA).json() if n["id"] == num["id"])
-check(stats["chats"] == 2 and stats["unread"] == 2, "Numbers list shows chats + unread per number")
+check(stats["chats"] == 3 and stats["unread"] == 2, "Numbers list shows chats + unread per number", f"{stats['chats']} chats, {stats['unread']} unread")
 d = client.get(f"/api/v1/inbox/conversations/{byphone['+919811111111']['id']}", headers=SA).json()
 check(next(n for n in client.get('/api/v1/numbers', headers=SA).json() if n['id'] == num['id'])['unread'] == 0, 'Opening a chat marks it read')
 check([m["text"] for m in d["messages"]] == ["Hello", "Is it still available?", "Great, see you"], "History is in order, oldest first")
@@ -262,12 +270,18 @@ check(webhook({"type": "message.new", "account_id": "acc_123", "payload": {"id":
 check(webhook({"type": "message.new", "account_id": "acc_123", "payload": {"id": "x"}}, ts=int(time.time()) - 3600).status_code == 403, "Stale timestamp rejected (403)")
 
 before = len(client.get(f"/api/v1/inbox/conversations/{conv['id']}", headers=ADMIN).json()["messages"])
+n_before = len(client.get("/api/v1/inbox/conversations", headers=ADMIN).json())
 inbound("m_own", sender="919876500001@s.whatsapp.net", is_sender=True)
 inbound("m_grp", sender="12345@g.us")
-inbound("m_lid", sender="999@lid")  # no phone available anywhere -> ignored
+inbound("m_sys", sender="0@s.whatsapp.net")
 after = len(client.get(f"/api/v1/inbox/conversations/{conv['id']}", headers=ADMIN).json()["messages"])
-check(before == after and len(client.get("/api/v1/inbox/conversations", headers=ADMIN).json()) == len(convs),
-      "Own messages, group chats and unresolvable @lid senders are ignored")
+check(before == after and len(client.get("/api/v1/inbox/conversations", headers=ADMIN).json()) == n_before,
+      "Own messages, group chats and WhatsApp's own system chat are ignored")
+inbound("m_lid", "hidden number here", sender="999@lid")  # WhatsApp shares no phone at all
+lid999 = next((c for c in client.get("/api/v1/inbox/conversations", headers=ADMIN).json() if c["contact"]["phone"] == "lid:999"), None)
+check(lid999 is not None and lid999["unread_count"] == 1, "A sender WhatsApp identifies only by a hidden id is not lost: the chat is created")
+client.post(f"/api/v1/inbox/conversations/{lid999['id']}/messages", headers=ADMIN, json={"type": "text", "text": "got it"})
+check(fake.calls[-1]["url"] == "https://api.unipile.com/v2/acc_123/chats/999@lid/messages/send", "...and you can answer it: the reply goes to that exact chat id")
 
 # @lid sender whose phone is exposed as public_identifier -> contact created, replies use the @lid chat id
 webhook({"type": "message.new", "account_id": "acc_123", "payload": {
@@ -279,7 +293,7 @@ check(lid_conv and lid_conv["contact"]["name"] == "Lid Person", "@lid sender is 
 r = client.post(f"/api/v1/inbox/conversations/{lid_conv['id']}/messages", headers=ADMIN, json={"type": "text", "text": "hi lid"})
 check(fake.calls[-1]["url"] == "https://api.unipile.com/v2/acc_123/chats/555111@lid/messages/send", "Reply to an @lid contact uses the chat id exactly as Unipile returned it")
 
-webhook({"type": "message.new", "account_id": "acc_123", "payload": {"id": "m_in_stop", "chat_id": "c", "sender_id": "919876500002@s.whatsapp.net", "text": "STOP", "is_sender": False, "attachments": []}})
+webhook({"type": "message.new", "account_id": "acc_123", "payload": {"id": "m_in_stop", "chat_id": "919876500002@s.whatsapp.net", "sender_id": "919876500002@s.whatsapp.net", "text": "STOP", "is_sender": False, "attachments": []}})
 contacts = client.get("/api/v1/contacts", headers=ADMIN).json()
 items = contacts["items"] if isinstance(contacts, dict) else contacts
 check(any(c["phone"] == "+919876500002" and c.get("opted_out") for c in items), "STOP opts the contact out")
@@ -514,7 +528,7 @@ check(len(fake.calls) == n4, "Pausing the automation stops runs that are waiting
 # --- ready-made automation templates ---------------------------------------------
 tl = client.get("/api/v1/automations/templates", headers=ADMIN).json()
 check(client.get("/api/v1/automations/templates").status_code == 401, "The template gallery needs a sign-in")
-check({t["id"] for t in tl} == {"welcome", "welcome_followup", "handoff", "qualify"} and all(t["steps"] and t["description"] for t in tl), "An Admin gets the template gallery")
+check({t["id"] for t in tl} == {"welcome", "welcome_followup", "handoff", "qualify", "keyword_reply", "keyword_human"} and all(t["steps"] and t["description"] and t["starts_when"] for t in tl), "An Admin gets the template gallery")
 check(client.post("/api/v1/automations/from-template", headers=ADMIN, json={"template_id": "nope"}).status_code == 404, "An unknown template is rejected")
 _make = lambda tid, h=ADMIN, **kw: client.post("/api/v1/automations/from-template", headers=h, json={"template_id": tid, **kw})
 r = _make("welcome", name="My welcome")
@@ -768,6 +782,156 @@ with SessionLocal() as db:
     sync.sync_history(db, db.query(WhatsAppNumber).filter(WhatsAppNumber.unipile_account_id == "acc_456").first())
     hm = db.query(Message).filter(Message.provider_message_id == "hist_1").first()
     check(hm is not None and hm.type.value == "image" and hm.media_url.startswith("/api/v1/media/m/"), "Imported history keeps photos too")
+
+# --- saved message templates (plain text, no provider involved) --------------------
+tpl = lambda h, **kw: client.post("/api/v1/templates", headers=h, json=kw)
+r = tpl(ADMIN, name="Opening hours", text="Hi {{name}}, we are open 9-6, Mon-Sat.")
+saved = r.json()
+check(r.status_code == 200 and saved["admin_id"] == rahul_id and saved["name"] == "Opening hours", "An Admin saves a message template")
+check([t["name"] for t in client.get("/api/v1/templates", headers=ADMIN).json()] == ["Opening hours"], "...and lists their own")
+check(client.get("/api/v1/templates", headers=other_h).json() == [], "Another Admin does not see it")
+check(client.patch(f"/api/v1/templates/{saved['id']}", headers=other_h, json={"name": "x", "text": "y"}).status_code == 404
+      and client.delete(f"/api/v1/templates/{saved['id']}", headers=other_h).status_code == 404, "...and cannot change or delete it")
+check(any(t["id"] == saved["id"] for t in client.get("/api/v1/templates", headers=SA).json()), "A Super Admin sees every template")
+check(tpl(ADMIN, name="", text="x").status_code == 422 and tpl(ADMIN, name="x", text="").status_code == 422 and tpl(ADMIN, name="  ", text="  ").status_code == 400, "Empty names or texts are refused")
+r = client.patch(f"/api/v1/templates/{saved['id']}", headers=ADMIN, json={"name": "Hours", "text": "We open at 9."})
+check(r.status_code == 200 and r.json()["name"] == "Hours" and r.json()["text"] == "We open at 9.", "A template can be edited")
+check(client.delete(f"/api/v1/templates/{saved['id']}", headers=ADMIN).status_code == 204 and client.get("/api/v1/templates", headers=ADMIN).json() == [], "...and deleted")
+
+# --- keyword automations: started by the incoming-message webhook ---------------------
+def kw_customer(text="hello"):
+    only_running(None)                                   # no automation runs while the contact is created
+    return new_customer(text)
+kw = _make("keyword_reply").json()
+check(kw["trigger_type"] == "keyword" and "price" in kw["trigger_config"]["keywords"] and kw["status"] == "Scheduled", "The keyword template creates a keyword automation")
+c1 = kw_customer()
+only_running(kw["id"]); n0 = len(fake.calls)
+inbound("kw_1", "Hi, what is the PRICE of the large one?", c1); ar.process_due_runs()
+check(len(fake.calls) == n0 + 1 and fake.calls[-1]["json"]["text"].startswith("Hi Asha, thanks for asking!"), "A message containing a keyword (any case) gets the automatic reply")
+inbound("kw_2", "and the price for two?", c1); ar.process_due_runs()
+check(len(fake.calls) == n0 + 1, "...but only once per chat per day")
+c2 = kw_customer(); only_running(kw["id"]); n1 = len(fake.calls)
+inbound("kw_3", "that is pricey", c2); ar.process_due_runs()
+inbound("kw_4", "no keyword here", c2); ar.process_due_runs()
+check(len(fake.calls) == n1, "Whole words only ('pricey') and no keyword: no reply")
+inbound("kw_5", "Pricing please", c2); ar.process_due_runs()
+check(len(fake.calls) == n1 + 1, "A different customer asking about 'pricing' is answered")
+only_running(None); n2 = len(fake.calls); c3 = kw_customer()
+inbound("kw_6", "price?", c3); ar.process_due_runs()
+check(len(fake.calls) == n2, "A paused keyword automation does nothing")
+only_running(kw["id"]); c4 = kw_customer("STOP"); only_running(kw["id"]); n3 = len(fake.calls)
+inbound("kw_7", "price", c4); ar.process_due_runs()
+check(len(fake.calls) == n3, "A customer who replied STOP is never auto-replied")
+with SessionLocal() as db:
+    check(db.get(Automation, uuid.UUID(kw["id"])).recipients == 2 and db.get(Automation, uuid.UUID(kw["id"])).sent == 2, "The automation counts who it answered")
+
+hk = _make("keyword_human").json(); only_running(None); c5 = kw_customer(); only_running(hk["id"]); n4 = len(fake.calls)
+inbound("kw_8", "I need HELP with my order", c5); ar.process_due_runs()
+check(len(fake.calls) == n4 + 1 and "member of our team" in fake.calls[-1]["json"]["text"] and any("handed this chat to a human" in (t or "") for t in notes(c5)), "'help' hands the chat to a human after a confirmation")
+
+# create/edit keyword automations by hand
+mk = lambda **kw_: client.post("/api/v1/automations", headers=ADMIN, json={"name": "Mine", **kw_})
+check(mk(trigger_type="keyword").status_code == 422 and mk(trigger_type="keyword", trigger_config={"keywords": ["  "]}).status_code == 422, "A keyword automation needs keywords")
+check(mk(trigger_type="telepathy").status_code == 422, "Unknown triggers are refused")
+mine = mk(trigger_type="keyword", trigger_config={"keywords": [" menu ", "hours"]}, flow={"nodes": [{"id": "trigger", "type": "trigger", "label": "Message contains keywords"}, {"id": "r", "type": "action", "label": "Send reply", "messageVariants": ["Open 9-6, {{name}}"]}]})
+check(mine.status_code == 200 and mine.json()["trigger_config"]["keywords"] == ["menu", "hours"], "Keywords are trimmed and saved")
+up = client.patch(f"/api/v1/automations/{mine.json()['id']}", headers=ADMIN, json={"trigger_type": "keyword", "trigger_config": {"keywords": ["menu", "location"]}})
+check(up.status_code == 200 and up.json()["trigger_config"]["keywords"] == ["menu", "location"], "The keywords can be changed later")
+check(client.patch(f"/api/v1/automations/{mine.json()['id']}", headers=ADMIN, json={"trigger_type": "keyword", "trigger_config": {}}).status_code == 422, "...but not emptied")
+only_running(None)
+
+# --- automated replies wait a random 15-30 seconds -------------------------------------
+from datetime import timedelta as _td3  # noqa: E402
+from app.services.automation_runner import reply_delay as _reply_delay  # noqa: E402
+settings.AUTOMATION_REPLY_DELAY_MIN, settings.AUTOMATION_REPLY_DELAY_MAX = 15, 30
+check(client.get("/api/v1/system/whatsapp", headers=ADMIN).json()["reply_delay"] == {"min": 15.0, "max": 30.0}, "The default wait (15-30 s) is reported to the app")
+
+def pending_waits():
+    with SessionLocal() as db:
+        rows = db.query(AutomationRun).filter(AutomationRun.status == "pending").all()
+        return [((_aw(r.run_at) - _aw(r.started_at)).total_seconds(), r) for r in rows], [(r.next_index, r.jitter_done, r.branch_queue) for r in rows]
+def _aw(d):
+    return d.replace(tzinfo=_tz.utc) if d.tzinfo is None else d
+
+welcome = _make("welcome").json(); only_running(welcome["id"]); n0 = len(fake.calls)
+waits = []
+for _ in range(20):
+    sender = f"91986{next(_n):07d}@s.whatsapp.net"
+    inbound("dl_" + sender.split("@")[0][-9:], "hello", sender)
+ar.process_due_runs()
+waits = [w for w, _ in pending_waits()[0]]
+check(len(fake.calls) == n0 and len(waits) == 20, "20 new customers: nothing is sent at the moment they write", f"sent {len(fake.calls) - n0}, waiting {len(waits)}")
+check(all(15 <= w <= 30.001 for w in waits), "Each reply is scheduled between 15 and 30 seconds later", f"min {min(waits):.1f} max {max(waits):.1f}")
+check(max(waits) - min(waits) > 4, "...and the delays are random, not one fixed number", f"spread {max(waits) - min(waits):.1f}s")
+ar.process_due_runs()
+check(len(fake.calls) == n0, "Polling again before the time has come still sends nothing")
+fast_forward(); ar.process_due_runs()
+check(len(fake.calls) == n0 + 20 and all("Thanks for contacting us" in c["json"]["text"] for c in fake.calls[n0:]), "Once the wait is over, each welcome is sent (exactly once)")
+fast_forward(); ar.process_due_runs()
+check(len(fake.calls) == n0 + 20, "...and never again")
+
+# follow-up inside the YES/NO branch waits too; the hand-over after a message does not need to
+only_running(_make("welcome_followup").json()["id"]); n1 = len(fake.calls); silent = new_customer()
+check(len(fake.calls) == n1, "Welcome + follow-up: the welcome waits")
+fast_forward(); ar.process_due_runs()
+check(len(fake.calls) == n1 + 1, "...then goes out")
+fast_forward(); ar.process_due_runs()          # the 2-hour wait is over -> 'replied?' -> NO branch
+q = pending_waits()[1]
+check(len(fake.calls) == n1 + 1 and q and q[0][2], "After the 2-hour wait, the follow-up is queued but waits its own 15-30 s first")
+fast_forward(); ar.process_due_runs()
+check(len(fake.calls) == n1 + 2 and "just checking in" in fake.calls[-1]["json"]["text"], "...then the follow-up is sent")
+
+only_running(_make("handoff").json()["id"]); n2 = len(fake.calls); h = new_customer()
+check(len(fake.calls) == n2 and not any("handed this chat" in (t or "") for t in notes(h)), "Hand over: the acknowledgement waits, so the hand-over waits behind it")
+fast_forward(); ar.process_due_runs()
+check(len(fake.calls) == n2 + 1 and any("handed this chat to a human" in (t or "") for t in notes(h)), "...then the acknowledgement goes out and the chat is handed over together")
+
+# keyword replies wait as well
+kwa = _make("keyword_reply").json(); only_running(None); kc = new_customer(); only_running(kwa["id"]); n3 = len(fake.calls)
+inbound("dl_kw", "what is the price?", kc); ar.process_due_runs()
+check(len(fake.calls) == n3, "A keyword auto-reply waits too")
+fast_forward(); ar.process_due_runs()
+check(len(fake.calls) == n3 + 1, "...and then arrives")
+
+# per-step override and sane bounds
+check(_reply_delay({}) == (15.0, 30.0) and _reply_delay({"replyDelay": {"min": 5, "max": 8}}) == (5.0, 8.0) and _reply_delay({"replyDelay": {"min": 0, "max": 0}}) == (0.0, 0.0),
+      "A step can set its own wait (or 0 for instant)")
+check(_reply_delay({"replyDelay": {"min": 20, "max": 5}}) == (20.0, 20.0) and _reply_delay({"replyDelay": {"min": "x", "max": None}}) == (15.0, 30.0)
+      and _reply_delay({"replyDelay": {"min": 0, "max": 99999}}) == (0.0, 3600.0), "Nonsense values fall back to safe ones")
+fast_flow = {"nodes": [{"id": "trigger", "type": "trigger", "label": "New customer"},
+                       {"id": "w", "type": "action", "label": "Send welcome message", "messageVariants": ["Instant {{name}}"], "replyDelay": {"min": 0, "max": 0}}]}
+only_running(client.post("/api/v1/automations", headers=ADMIN, json={"name": "Instant", "flow": fast_flow}).json()["id"]); n4 = len(fake.calls); new_customer()
+check(len(fake.calls) == n4 + 1 and fake.calls[-1]["json"]["text"] == "Instant Asha", "A step with replyDelay 0/0 sends immediately")
+five = {"nodes": [fast_flow["nodes"][0], {**fast_flow["nodes"][1], "replyDelay": {"min": 5, "max": 5}}]}
+only_running(client.post("/api/v1/automations", headers=ADMIN, json={"name": "Five", "flow": five}).json()["id"]); n5 = len(fake.calls); new_customer()
+w5 = pending_waits()[0]
+check(len(fake.calls) == n5 and len(w5) == 1 and 4.9 <= w5[0][0] <= 5.1, "A step with replyDelay 5/5 waits 5 seconds")
+only_running(None)
+settings.AUTOMATION_REPLY_DELAY_MIN, settings.AUTOMATION_REPLY_DELAY_MAX = 0, 0
+
+# --- hidden-number chats, system chats, cleanup -------------------------------------
+from app.models.contact import Contact  # noqa: E402
+from app.services.campaign_runner import resolve_audience  # noqa: E402
+nop_id = next(c["id"] for c in client.get("/api/v1/inbox/conversations", headers=SA).json() if c["contact"]["phone"] == "lid:nophone")
+r = client.post(f"/api/v1/inbox/conversations/{nop_id}/messages", headers=SA, json={"type": "text", "text": "hello you"})
+check(r.json()["status"] == "sent" and fake.calls[-1]["url"] == "https://api.unipile.com/v2/acc_123/chats/nophone@lid/messages/send",
+      "An imported hidden-number chat can be answered (reply goes to its own chat id)")
+r = upload("pic.png", PNG, "image/png", cid=nop_id)
+check(fake.calls[-1]["url"].endswith("/chats/nophone@lid/messages/send") and r.status_code == 200, "...with attachments too")
+with SessionLocal() as db:
+    n123 = db.query(WhatsAppNumber).filter(WhatsAppNumber.unipile_account_id == "acc_123").first()
+    check(not any((c.phone or "").startswith("lid:") for c in resolve_audience(db, n123, {})[0]), "Campaigns never dial a hidden-number contact (they can only be answered in their chat)")
+    # leftovers from an earlier version: WhatsApp's own chat imported as "WhatsApp Business +0"
+    ghost = Contact(name="WhatsApp Business", phone="+0", whatsapp_number_id=n123.id, admin_id=n123.admin_id, tags=["WhatsApp"], source="Existing chat")
+    db.add(ghost); db.flush()
+    gconv = Conversation(contact_id=ghost.id, whatsapp_number_id=n123.id, admin_id=n123.admin_id, provider_chat_id="0@s.whatsapp.net")
+    db.add(gconv); db.flush()
+    db.add(Message(conversation_id=gconv.id, sender=MessageSender.CUSTOMER, type=MessageType.TEXT, text="Welcome to WhatsApp Business", status=MessageStatus.DELIVERED))
+    db.commit()
+    total = db.query(Conversation).count()
+    check(sync.purge_system_chats(db) == 1 and db.query(Conversation).count() == total - 1 and db.query(Contact).filter(Contact.phone == "+0").count() == 0,
+          "A leftover 'WhatsApp Business +0' chat from the old importer is removed automatically")
+    check(sync.purge_system_chats(db) == 0, "...and real chats are untouched")
 
 # --- demo-data cleanup ------------------------------------------------------------
 from app.services.demo_cleanup import purge_demo_data  # noqa: E402
