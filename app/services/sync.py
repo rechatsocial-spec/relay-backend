@@ -34,6 +34,7 @@ from app.models.whatsapp_number import NumberStatus, WhatsAppNumber
 from app.services.chat_utils import (
     attachment_fields, digits_to_phone, find_contact, is_person_chat, is_system_chat, lid_placeholder, phone_from_user_id,
 )
+from app.services.automation_runner import start_keyword_automations, start_new_customer_automations
 from app.services.connection_status import _MAP
 from app.services.messaging import get_or_create_conversation, utcnow
 
@@ -44,6 +45,7 @@ CHAT_PAGE = 50
 MAX_CHATS = 200          # per number, first import
 MESSAGES_PER_CHAT = 40
 PAUSE_SECONDS = 0.2
+FRESH_SECONDS = 15 * 60  # an imported customer message newer than this still gets the automatic reply; older ones are history
 
 STATE = {"last_run_at": None, "last_ok_at": None, "error": None, "accounts_found": 0, "imported_chats": 0, "history_importing": False,
          "application_id": None}
@@ -225,6 +227,7 @@ def _import_chat(db: Session, number: WhatsAppNumber, chat: dict) -> int:
     # whose chat is this? An existing conversation knows; otherwise the phone (or, if WhatsApp hides it, the chat's own id)
     conv = db.query(Conversation).filter(Conversation.provider_chat_id == chat_id, Conversation.whatsapp_number_id == number.id).first()
     is_new_conv = conv is None
+    new_contact = False
     if conv is not None:
         contact = db.get(Contact, conv.contact_id)
     else:
@@ -237,6 +240,7 @@ def _import_chat(db: Session, number: WhatsAppNumber, chat: dict) -> int:
         key = phone or lid_placeholder(user_id)
         contact = find_contact(db, number, key)
         if contact is None:
+            new_contact = True
             contact = Contact(
                 name=(chat.get("name") or profile.get("display_name") or profile.get("first_name") or phone or "WhatsApp contact")[:120],
                 phone=key, whatsapp_number_id=number.id, admin_id=number.admin_id,
@@ -256,6 +260,8 @@ def _import_chat(db: Session, number: WhatsAppNumber, chat: dict) -> int:
                      if m.provider_message_id not in batch_ids]
 
     last_any, last_in, new_inbound, added = None, None, 0, 0
+    fresh_texts = []
+    now_utc = datetime.now(timezone.utc)
     for ts, m in items:
         last_any = ts
         if not m.get("is_sender"):
@@ -277,12 +283,22 @@ def _import_chat(db: Session, number: WhatsAppNumber, chat: dict) -> int:
         else:
             sender, status = MessageSender.CUSTOMER, MessageStatus.DELIVERED
             new_inbound += 1
+            if (now_utc - ts).total_seconds() <= FRESH_SECONDS:
+                fresh_texts.append(m.get("text") or "")
         mid = uuid.uuid4()
         fields = {"type": MessageType.TEXT, **attachment_fields(first, mid)}
         db.add(Message(id=mid, conversation_id=conv.id, sender=sender, text=m.get("text") or None,
                        status=status, provider_message_id=m["id"], created_at=ts, **fields))
         added += 1
 
+    # The webhook starts automations for live messages; a message that only reached us through this catch-up must too,
+    # otherwise customers whose notification was missed never get the automatic reply. Old history never triggers.
+    if fresh_texts and not contact.opted_out:
+        if new_contact:
+            start_new_customer_automations(db, number, contact, conv)
+        for t in fresh_texts:
+            start_keyword_automations(db, number, contact, conv, t)
+        log.warning("Automations queued from catch-up for %s (%s fresh message(s))", number.phone, len(fresh_texts))
     if last_any and (conv.last_message_at is None or is_new_conv or last_any > _aware(conv.last_message_at)):
         conv.last_message_at = last_any
     if last_in and (conv.last_inbound_at is None or last_in > _aware(conv.last_inbound_at)):
